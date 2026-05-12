@@ -3,11 +3,18 @@ from environment.env import XArmEnvironment
 
 
 class Simple_Task:
-    def __init__(self, reset_position=None):
+    def __init__(self, reset_position=None, reset_orientation=None):
         if reset_position is None:
             reset_position = [400, 0.0, 290.0]
-        
-        self.env = XArmEnvironment(reset_position=reset_position, use_gripper=True)
+        if reset_orientation is None:
+            # End-effector pointing straight down (xArm euler xyz, degrees).
+            reset_orientation = [180.0, 0.0, 0.0]
+
+        self.env = XArmEnvironment(
+            reset_position=reset_position,
+            reset_orientation=reset_orientation,
+            use_gripper=True,
+        )
     
     def reset(self, duration=3.0):
         return self.env.reset(duration=duration)

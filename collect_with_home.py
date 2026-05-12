@@ -1,11 +1,11 @@
 import time
 import numpy as np
 import argparse
-from pynput.keyboard import KeyCode
+# from pynput.keyboard import KeyCode  # disabled: needs X display, breaks over SSH. Quit with Ctrl+C instead.
 
 from environment.phone import Phone
 from recorder import DatasetRecorder
-from environment.keystroke_counter import KeystrokeCounter
+# from environment.keystroke_counter import KeystrokeCounter  # disabled with pynput above
 from tasks.simple_task import Simple_Task
 from threads import PhoneReadThread, RecordingThread
 
@@ -34,8 +34,8 @@ if __name__ == "__main__":
         recording_thread = RecordingThread(recorder, env, frequency)
         recording_thread.start()
 
-    keystroke_counter = KeystrokeCounter()
-    keystroke_counter.start()
+    # keystroke_counter = KeystrokeCounter()
+    # keystroke_counter.start()
 
     phone_thread = PhoneReadThread(phone)
     phone_thread.start()
@@ -46,7 +46,8 @@ if __name__ == "__main__":
 
     print("Phone Button - Home robot, then start/stop recording" if args.record else "Phone Button - Disabled (no recording)")
     print(f"Recording frequency: {frequency} Hz" if args.record else "Recording: Disabled")
-    print("[Q] - Quit")
+    # print("[Q] - Quit")  # disabled with keystroke_counter
+    print("[Ctrl+C] - Quit (graceful shutdown via KeyboardInterrupt handler)")
 
     try:
         while True:
@@ -81,20 +82,21 @@ if __name__ == "__main__":
             else:
                 target_pose, grasp_state, _ = phone_thread.get_data()
 
-            key_events = keystroke_counter.get_press_events()
-            for key in key_events:
-                if key == KeyCode(char='q'):
-                    print("Quitting...")
-                    if args.record:
-                        if recording_thread.is_recording():
-                            recorder.end_episode()
-                        recording_thread.stop()
-                        recording_thread.join(timeout=2.0)
-                        recorder.close()
-                    phone_thread.stop()
-                    phone_thread.join(timeout=2.0)
-                    keystroke_counter.stop()
-                    exit(0)
+            # q-key quit disabled (pynput needs X). Quit with Ctrl+C — the KeyboardInterrupt handler below does the same cleanup.
+            # key_events = keystroke_counter.get_press_events()
+            # for key in key_events:
+            #     if key == KeyCode(char='q'):
+            #         print("Quitting...")
+            #         if args.record:
+            #             if recording_thread.is_recording():
+            #                 recorder.end_episode()
+            #             recording_thread.stop()
+            #             recording_thread.join(timeout=2.0)
+            #             recorder.close()
+            #         phone_thread.stop()
+            #         phone_thread.join(timeout=2.0)
+            #         keystroke_counter.stop()
+            #         exit(0)
 
             if target_pose is None:
                 time.sleep(0.001)
@@ -116,4 +118,4 @@ if __name__ == "__main__":
             recorder.close()
         phone_thread.stop()
         phone_thread.join(timeout=2.0)
-        keystroke_counter.stop()
+        # keystroke_counter.stop()

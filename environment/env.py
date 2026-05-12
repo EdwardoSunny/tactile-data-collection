@@ -6,13 +6,15 @@ from environment.xarm_controller import XArm, XArmConfig
 from environment.utils import get_cameras
 
 class XArmEnvironment:
-    def __init__(self, reset_position=None, use_gripper=False):
+    def __init__(self, reset_position=None, reset_orientation=None, use_gripper=False):
         self.cameras = get_cameras()
         xarm_config = XArmConfig(use_gripper=use_gripper)
         self.xarm_config = xarm_config
         self.xarm = XArm(xarm_config)
         self.bounds = np.array([[250.0, 800.0],[-600.0, 600.0],[50.0, 400.0]])
         self.reset_position = reset_position if reset_position is not None else [461.148376, 0.0, 85.0]
+        # None = legacy behavior of holding whatever rotation the arm currently has.
+        self.reset_orientation = reset_orientation
         self.xarm.initialize()
 
     def step(self, grasp, target_pose=None, delta_target_pose=None, timesteps=None):
@@ -36,36 +38,45 @@ class XArmEnvironment:
             obs[f"camera_{camera.index}"] = camera.get_latest()
         return obs
     
-    def go_to_position(self, target_position, duration=2.0, frequency=30, grasp=0.0):
+    def go_to_position(self, target_position, duration=2.0, frequency=30, grasp=0.0, target_orientation=None):
         current_pose_6d = self.get_pose_6d()
         current_position = np.array(current_pose_6d[:3], dtype=np.float64)
         current_orientation = np.array(current_pose_6d[3:6], dtype=np.float64)
-        
+
         target_position = np.array(target_position, dtype=np.float64)
         target_position = np.clip(target_position, self.bounds[:,0], self.bounds[:,1])
-        
+
+        # Wrap each axis's delta into [-180, 180] so we always take the shortest angular path,
+        # avoiding a 350-degree spin when the start/target straddle the +/-180 wraparound.
+        if target_orientation is not None:
+            target_orientation = np.array(target_orientation, dtype=np.float64)
+            delta_orientation = ((target_orientation - current_orientation + 180.0) % 360.0) - 180.0
+        else:
+            delta_orientation = np.zeros(3)
+
         num_steps = int(duration * frequency)
         dt = 1.0 / frequency
-        
+
         for step in range(num_steps + 1):
             alpha = step / num_steps
             smooth_alpha = (1 - np.cos(alpha * np.pi)) / 2
             interpolated_position = current_position + smooth_alpha * (target_position - current_position)
             interpolated_position = np.clip(interpolated_position, self.bounds[:,0], self.bounds[:,1])
-            
+            interpolated_orientation = current_orientation + smooth_alpha * delta_orientation
+
             self.xarm.step_abs(
                 new_position=interpolated_position,
-                new_orientation=current_orientation,
+                new_orientation=interpolated_orientation,
                 grasp=grasp
             )
-            
+
             if step < num_steps:
                 time.sleep(dt)
-        
+
         return self.get_obs()
-    
+
     def reset(self, duration=3.0):
-        return self.go_to_position(self.reset_position, duration=duration)
+        return self.go_to_position(self.reset_position, duration=duration, target_orientation=self.reset_orientation)
     
     def render(self):
         frames_list = []
