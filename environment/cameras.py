@@ -14,8 +14,13 @@ class Camera:
         self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         
         self.pipeline = rs.pipeline()
-        self.pipeline.start(self.config)
-        
+        profile = self.pipeline.start(self.config)
+
+        # Cache color-stream intrinsics so the tactile overlay can project
+        # 3D sensor positions to pixels without re-querying every frame.
+        color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        self.intrinsics = color_profile.get_intrinsics()
+
         self.latest_color_frame = None
         self.latest_color_image = None
     
