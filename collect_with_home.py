@@ -19,10 +19,58 @@ the script works headless over SSH.
 """
 import argparse
 import os
+import select
+import sys
+import termios
 import time
+import tty
 
 import cv2
 import numpy as np
+
+
+# Set in main() once stdin is in cbreak mode. Read non-blockingly each tick.
+_stdin_in_cbreak = False
+_stdin_old_attrs = None
+
+
+def _enter_cbreak_mode():
+    """Put stdin in single-key non-blocking mode (works over SSH, no X needed)."""
+    global _stdin_in_cbreak, _stdin_old_attrs
+    if _stdin_in_cbreak or not sys.stdin.isatty():
+        return
+    try:
+        _stdin_old_attrs = termios.tcgetattr(sys.stdin.fileno())
+        tty.setcbreak(sys.stdin.fileno())
+        _stdin_in_cbreak = True
+    except Exception as e:
+        print(f"  [warn] couldn't enable single-key terminal input: {e}")
+
+
+def _leave_cbreak_mode():
+    """Restore stdin to its original mode (must be called before exiting)."""
+    global _stdin_in_cbreak, _stdin_old_attrs
+    if _stdin_in_cbreak and _stdin_old_attrs is not None:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(),
+                              termios.TCSADRAIN, _stdin_old_attrs)
+        except Exception:
+            pass
+    _stdin_in_cbreak = False
+    _stdin_old_attrs = None
+
+
+def _read_one_key_nonblocking():
+    """Return one character from stdin if ready, else None. No blocking."""
+    if not _stdin_in_cbreak:
+        return None
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if r:
+            return sys.stdin.read(1)
+    except Exception:
+        pass
+    return None
 
 import tactile_config as tc
 from environment import tactile_overlay
@@ -109,6 +157,10 @@ def _parse_args():
     p.add_argument("--no-record-video", action="store_true",
                    help="Don't write per-episode mp4 files alongside the zarr "
                         "(saved by default to teleop_data.zarr_videos/).")
+    p.add_argument("--no-save-raw-images", action="store_true",
+                   help="Don't store the un-overlaid /data/img_*_raw arrays "
+                        "(default: stored, ~1.5x image storage cost; lets you "
+                        "re-render with a different overlay mode later).")
     return p.parse_args()
 
 
@@ -170,6 +222,7 @@ def _print_banner(args, tactile, agent_overlay_ok, wrist_overlay_ok, frequency):
     print(f"  Viz windows : {'ON  (close with Ctrl+C in terminal)' if args.viz else 'OFF'}")
     print(f"  Reset pose  : pos=[400, 0, 290]  rot=[180, 0, 0]")
     print(f"  Phone btn A : start / stop episode (robot homes first)")
+    print(f"  Backspace   : discard last episode (after stopping with A)")
     print(f"  Ctrl+C      : quit and flush to disk")
     print("=" * 60)
     print()
@@ -247,6 +300,7 @@ def main():
                     tactile_baseline=baseline,   # saved once to /meta/tactile_baseline
                     record_videos=(not args.no_record_video),
                     video_fps=frequency,         # match the recording tick rate
+                    save_raw_images=(not args.no_save_raw_images),
                 )
             recording_thread = RecordingThread(
                 recorder, env, frequency,
@@ -266,6 +320,8 @@ def main():
         phone_thread.start()
 
         _print_banner(args, tactile, agent_overlay_ok, wrist_overlay_ok, frequency)
+        # Single-key non-blocking terminal input (used for 'd' = discard).
+        _enter_cbreak_mode()
 
         last_button_check = 0.0
         button_cooldown = 3.0
@@ -332,6 +388,25 @@ def main():
                 else:
                     target_pose, grasp_state, _ = phone_thread.get_data()
 
+                # Terminal keyboard discard: press BACKSPACE to drop the most
+                # recently COMPLETED episode (recording must be stopped first).
+                # \x7f = DEL (most modern terminals' Backspace), \x08 = BS
+                # (older terminals). Works over SSH; uses the termios cbreak
+                # mode set up at startup.
+                if args.record and recorder is not None:
+                    key = _read_one_key_nonblocking()
+                    if key in ("\x7f", "\x08"):
+                        if recording_thread is not None and recording_thread.is_recording():
+                            print("  [discard] currently recording — press A to stop first, then Backspace.")
+                        else:
+                            n_removed = recorder.discard_last_episode()
+                            if n_removed > 0:
+                                episode_num = max(0, episode_num - 1)
+                                print(f"  [discard] removed last episode ({n_removed} frames)."
+                                      f"  Dataset now has {recorder.zarr_n} frames.")
+                            else:
+                                print(f"  [discard] no completed episode to remove.")
+
                 # Live viz windows. Pulls the recording_thread's cached native-res
                 # overlaid images; if cv2 can't talk to a display (e.g. SSH without
                 # X forwarding), disable for the rest of the session instead of
@@ -392,6 +467,7 @@ def main():
                 except Exception:
                     pass
     finally:
+        _leave_cbreak_mode()
         if tactile is not None:
             tactile.__exit__(None, None, None)
 

@@ -105,3 +105,6 @@ class Phone:
     
     def get_button_state(self):
         return self.session.get_latest_data()["button"]
+
+    def get_button_secondary_state(self):
+        return bool(self.session.get_latest_data().get("button_secondary", False))

@@ -21,12 +21,18 @@ _num_compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
 class DatasetRecorder:
     def __init__(self, path, memory_buffer_size=5000, flush_interval=1.0,
                  use_actions=True, use_tactile=False, tactile_baseline=None,
-                 record_videos=True, video_fps=10.0):
+                 record_videos=True, video_fps=10.0,
+                 save_raw_images=True):
         self.path = path
         self.memory_buffer_size = memory_buffer_size
         self.flush_interval = flush_interval
         self.use_actions = use_actions
         self.use_tactile = use_tactile
+        # When True we also store /data/img_{i}_raw arrays containing the
+        # un-overlaid frames, so training / re-rendering can pick raw vs
+        # overlay at any time. The overlay-burned /data/img_{i} is always
+        # saved either way (it's the "live" visualization).
+        self.save_raw_images = bool(save_raw_images)
         # Optional per-cell idle baseline (n_sensors, n_taxels, 3). Saved
         # once to /meta/tactile_baseline so downstream code can subtract it
         # to get a delta-from-idle view of /data/tactile (which stays raw).
@@ -48,6 +54,7 @@ class DatasetRecorder:
             'state': deque(maxlen=memory_buffer_size),
             'n_contacts': deque(maxlen=memory_buffer_size),
             'imgs': [],
+            'imgs_raw': [],  # populated only if save_raw_images
         }
         if self.use_actions:
             self.memory_buffer['action'] = deque(maxlen=memory_buffer_size)
@@ -75,6 +82,8 @@ class DatasetRecorder:
         
         self.num_cameras = len(img_shapes)
         self.memory_buffer['imgs'] = [deque(maxlen=self.memory_buffer_size) for _ in range(self.num_cameras)]
+        if self.save_raw_images:
+            self.memory_buffer['imgs_raw'] = [deque(maxlen=self.memory_buffer_size) for _ in range(self.num_cameras)]
         
         if "state" in data:
             self.zarr_n = data["state"].shape[0]
@@ -98,6 +107,12 @@ class DatasetRecorder:
                     chunks=(32, *img_shape), dtype=np.float32,
                     compressor=_img_compressor,
                 )
+                if self.save_raw_images:
+                    data.create_dataset(
+                        f"img_{i}_raw", shape=(0, *img_shape),
+                        chunks=(32, *img_shape), dtype=np.float32,
+                        compressor=_img_compressor,
+                    )
             data.create_dataset(
                 "n_contacts", shape=(0, 1),
                 chunks=(1024, 1), dtype=np.float32,
@@ -221,6 +236,8 @@ class DatasetRecorder:
         if self.use_actions:
             actions = list(self.memory_buffer['action'])
         imgs = [list(self.memory_buffer['imgs'][i]) for i in range(self.num_cameras)]
+        if self.save_raw_images:
+            imgs_raw = [list(self.memory_buffer['imgs_raw'][i]) for i in range(self.num_cameras)]
         if self.use_tactile:
             tactile           = list(self.memory_buffer['tactile'])
             tactile_connected = list(self.memory_buffer['tactile_connected'])
@@ -234,6 +251,8 @@ class DatasetRecorder:
             self.memory_buffer['action'].clear()
         for i in range(self.num_cameras):
             self.memory_buffer['imgs'][i].clear()
+            if self.save_raw_images:
+                self.memory_buffer['imgs_raw'][i].clear()
         if self.use_tactile:
             self.memory_buffer['tactile'].clear()
             self.memory_buffer['tactile_connected'].clear()
@@ -250,6 +269,9 @@ class DatasetRecorder:
         min_length = min(min_length, len(n_contacts))
         if self.num_cameras > 0:
             min_length = min(min_length, min(len(imgs[i]) for i in range(self.num_cameras)))
+            if self.save_raw_images:
+                min_length = min(min_length,
+                                 min(len(imgs_raw[i]) for i in range(self.num_cameras)))
         if self.use_tactile:
             min_length = min(min_length, len(tactile), len(tactile_connected),
                              len(tactile_ts_ms), len(tactile_lag_ms))
@@ -268,6 +290,8 @@ class DatasetRecorder:
         if self.use_actions:
             actions = actions[:min_length]
         imgs = [img_list[:min_length] for img_list in imgs]
+        if self.save_raw_images:
+            imgs_raw = [img_list[:min_length] for img_list in imgs_raw]
         if self.use_tactile:
             tactile           = tactile[:min_length]
             tactile_connected = tactile_connected[:min_length]
@@ -279,6 +303,8 @@ class DatasetRecorder:
         if self.use_actions:
             actions_array = np.array(actions)
         imgs_arrays = [np.array(img_list) for img_list in imgs]
+        if self.save_raw_images:
+            imgs_raw_arrays = [np.array(img_list) for img_list in imgs_raw]
         if self.use_tactile:
             tactile_arr           = np.asarray(tactile,           dtype=np.float32)
             tactile_connected_arr = np.asarray(tactile_connected, dtype=np.uint8)
@@ -295,6 +321,8 @@ class DatasetRecorder:
         data["n_contacts"].resize((new_size, data["n_contacts"].shape[1]))
         for i in range(self.num_cameras):
             data[f"img_{i}"].resize((new_size, *data[f"img_{i}"].shape[1:]))
+            if self.save_raw_images and f"img_{i}_raw" in data:
+                data[f"img_{i}_raw"].resize((new_size, *data[f"img_{i}_raw"].shape[1:]))
         if self.use_tactile:
             data["tactile"].resize((new_size, *data["tactile"].shape[1:]))
             data["tactile_connected"].resize((new_size, *data["tactile_connected"].shape[1:]))
@@ -307,6 +335,8 @@ class DatasetRecorder:
         data["n_contacts"][self.zarr_n:new_size] = n_contacts_array
         for i in range(self.num_cameras):
             data[f"img_{i}"][self.zarr_n:new_size] = imgs_arrays[i]
+            if self.save_raw_images and f"img_{i}_raw" in data:
+                data[f"img_{i}_raw"][self.zarr_n:new_size] = imgs_raw_arrays[i]
         if self.use_tactile:
             data["tactile"][self.zarr_n:new_size]           = tactile_arr
             data["tactile_connected"][self.zarr_n:new_size] = tactile_connected_arr
@@ -326,7 +356,8 @@ class DatasetRecorder:
         
     def append(self, state, n_contacts, imgs, action=None,
                tactile=None, tactile_connected=None,
-               tactile_ts_ms=None, tactile_lag_ms=None):
+               tactile_ts_ms=None, tactile_lag_ms=None,
+               imgs_raw=None):
         if not self.initialized:
             state_dim = len(state)
             act_dim = len(action) if action is not None else 1
@@ -354,6 +385,14 @@ class DatasetRecorder:
                 except Exception as e:
                     print(f"  [warn] video write failed for cam {i}: {e}")
             self.memory_buffer['imgs'][i].append(img / 255.0)
+
+        # Raw (no-overlay) frames stored separately so post-hoc rendering or
+        # training can pick raw vs overlay. Falls back to `imgs` if caller
+        # didn't pass raw versions (shapes stay aligned either way).
+        if self.save_raw_images:
+            raw_source = imgs_raw if imgs_raw is not None else imgs
+            for i, img in enumerate(raw_source):
+                self.memory_buffer['imgs_raw'][i].append(img / 255.0)
 
         if self.use_tactile:
             # Caller is required to pass all four tactile fields when use_tactile=True.
@@ -383,6 +422,67 @@ class DatasetRecorder:
         self._ep_step_counter = 0
         # Finalize this episode's MP4s; next append starts a new one.
         self._close_video_writers()
+
+    def discard_last_episode(self) -> int:
+        """Remove the most recently completed episode from the dataset.
+
+        Flushes any in-memory data first so zarr matches in-memory state, then:
+          - truncates every /data/* array back to the previous episode's end
+          - pops the last entry from /meta/episode_ends
+          - deletes the mp4 files for that episode (cam_0, cam_1, ...)
+          - rewinds zarr_n and the video episode counter
+
+        Refuses if an episode is currently in progress (caller should stop
+        recording with end_episode() first). Returns the number of frames
+        removed, or 0 if there was nothing to discard.
+        """
+        if self._video_writers:
+            print("  [discard] in-progress episode — close it via end_episode() first.")
+            return 0
+
+        # Make sure any pending append has hit disk before we truncate.
+        self._flush_to_zarr()
+
+        if not self.initialized or self.store is None:
+            return 0
+        meta = self.store["meta"]
+        if "episode_ends" not in meta:
+            return 0
+        ends_arr = meta["episode_ends"]
+        n_eps = int(ends_arr.shape[0])
+        if n_eps == 0:
+            return 0
+
+        last_end   = int(ends_arr[-1])
+        last_start = int(ends_arr[-2]) if n_eps > 1 else 0
+        n_removed  = last_end - last_start
+
+        # Truncate every per-frame array under /data back to last_start.
+        data = self.store["data"]
+        for key in list(data.keys()):
+            arr = data[key]
+            if arr.shape[0] > last_start:
+                arr.resize((last_start,) + arr.shape[1:])
+
+        # Pop the trailing episode_ends entry.
+        ends_arr.resize((n_eps - 1,))
+
+        # Rewind our running counter.
+        self.zarr_n = last_start
+
+        # Delete the mp4 files for this episode and rewind the counter.
+        if self.record_videos and self._video_dir and self._video_episode_num > 0:
+            ep = self._video_episode_num
+            for i in range(self.num_cameras or 0):
+                p = os.path.join(self._video_dir, f"ep_{ep:03d}_cam_{i}.mp4")
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception as e:
+                    print(f"  [discard] couldn't remove {p}: {e}")
+            self._video_episode_num -= 1
+
+        return n_removed
         # print(f"Episode ended at step {relative_end} (memory buffer)")  # disabled — collect_with_home.py prints its own per-episode summary
         
     def close(self):

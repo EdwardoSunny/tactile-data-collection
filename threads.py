@@ -27,10 +27,15 @@ class PhoneReadThread(threading.Thread):
         self.latest_target_pose = None
         self.latest_grasp_state = 0.0
         self.latest_button_state = False
+        self.latest_button_secondary_state = False
 
     def get_data(self):
         with self._lock:
             return self.latest_target_pose, self.latest_grasp_state, self.latest_button_state
+
+    def get_button_secondary(self) -> bool:
+        with self._lock:
+            return self.latest_button_secondary_state
 
     def stop(self):
         self.stop_thread = True
@@ -41,10 +46,14 @@ class PhoneReadThread(threading.Thread):
                 target_pose = self.phone.get_target_pose()
                 grasp_state = self.phone.get_grasp_state()
                 button_state = self.phone.get_button_state()
+                # TeleDex's second on-screen button. Used by collect_with_home.py
+                # as a "discard most recent episode" trigger.
+                button_secondary_state = self.phone.get_button_secondary_state()
                 with self._lock:
                     self.latest_target_pose = target_pose
                     self.latest_grasp_state = grasp_state
                     self.latest_button_state = button_state
+                    self.latest_button_secondary_state = button_secondary_state
             except Exception as e:
                 print(f"Error reading phone data: {e}")
             time.sleep(0.001)
@@ -232,7 +241,16 @@ class RecordingThread(threading.Thread):
             vals_L = vals_R = conn_L = conn_R = None
             tactile_values = tactile_connected = ts_arr = lag_arr = None
 
-        agent_img, wrist_img = self._pick_cameras(obs)
+        agent_img_raw, wrist_img_raw = self._pick_cameras(obs)
+        # Defensive copies — _pick_cameras may return numpy views over rs
+        # frame buffers that get recycled. Also keep these as the "raw" copy
+        # before any overlay drawing.
+        if agent_img_raw is not None:
+            agent_img_raw = agent_img_raw.copy()
+        if wrist_img_raw is not None:
+            wrist_img_raw = wrist_img_raw.copy()
+        agent_img = None if agent_img_raw is None else agent_img_raw.copy()
+        wrist_img = None if wrist_img_raw is None else wrist_img_raw.copy()
 
         # Overlay is drawn on the native-resolution image, BEFORE the 224x224 resize.
         if self.use_tactile and self.draw_overlay:
@@ -256,6 +274,7 @@ class RecordingThread(threading.Thread):
             self._latest_viz_time = time.monotonic()
 
         return (state, agent_img, wrist_img,
+                agent_img_raw, wrist_img_raw,
                 tactile_values, tactile_connected, ts_arr, lag_arr)
 
     def _record_one_tick(self):
@@ -268,20 +287,34 @@ class RecordingThread(threading.Thread):
         if result is None or self.recorder is None:
             return
         (state, agent_img, wrist_img,
+         agent_img_raw, wrist_img_raw,
          tactile_values, tactile_connected, ts_arr, lag_arr) = result
 
-        camera_imgs = []
-        for img in (agent_img, wrist_img):
+        # Race guard: the main thread may have called set_recording(False)
+        # while we were inside _compute_tick (env.get_obs + overlay drawing
+        # together can take 40-80ms). If recording was just turned off, drop
+        # this frame entirely — otherwise it'd land AFTER end_episode() ran,
+        # opening a fresh video writer and creating an orphan frame that
+        # makes discard_last_episode() falsely see an "in-progress" episode.
+        with self._lock:
+            still_recording = self.recording and self.episode_started
+        if not still_recording:
+            return
+
+        def _to_224(img):
             if img is None:
-                camera_imgs.append(np.zeros((224, 224, 3), dtype=np.uint8))
-            else:
-                camera_imgs.append(cv2.resize(img, (224, 224)))
+                return np.zeros((224, 224, 3), dtype=np.uint8)
+            return cv2.resize(img, (224, 224))
+
+        camera_imgs     = [_to_224(agent_img),     _to_224(wrist_img)]
+        camera_imgs_raw = [_to_224(agent_img_raw), _to_224(wrist_img_raw)]
 
         if tactile_values is not None:
             self.recorder.append(
                 state=state,
                 n_contacts=np.array([0]),
                 imgs=camera_imgs,
+                imgs_raw=camera_imgs_raw,
                 tactile=tactile_values,
                 tactile_connected=tactile_connected,
                 tactile_ts_ms=ts_arr,
@@ -292,6 +325,7 @@ class RecordingThread(threading.Thread):
                 state=state,
                 n_contacts=np.array([0]),
                 imgs=camera_imgs,
+                imgs_raw=camera_imgs_raw,
             )
 
     def get_latest_viz(self):
