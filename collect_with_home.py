@@ -154,9 +154,6 @@ def _parse_args():
                    help="What the overlay draws: arrow (single per finger; default), "
                         "grid (9 arrows per finger), point (single circle per finger), "
                         "bar (binary bottom-bars per finger).")
-    p.add_argument("--no-record-video", action="store_true",
-                   help="Don't write per-episode mp4 files alongside the zarr "
-                        "(saved by default to teleop_data.zarr_videos/).")
     p.add_argument("--no-save-raw-images", action="store_true",
                    help="Don't store the un-overlaid /data/img_*_raw arrays "
                         "(default: stored, ~1.5x image storage cost; lets you "
@@ -205,9 +202,7 @@ def _print_banner(args, tactile, agent_overlay_ok, wrist_overlay_ok, frequency):
     print("  READY")
     print("=" * 60)
     if args.record:
-        video_status = "OFF" if args.no_record_video else f"ON  (-> teleop_data.zarr_videos/)"
         print(f"  Recording   : ON ({frequency:.0f} Hz)  ->  teleop_data.zarr")
-        print(f"  MP4 videos  : {video_status}")
     else:
         print(f"  Recording   : OFF  (pass --record to enable)")
     if tactile is not None:
@@ -298,8 +293,6 @@ def main():
                     use_actions=False,
                     use_tactile=(tactile is not None),
                     tactile_baseline=baseline,   # saved once to /meta/tactile_baseline
-                    record_videos=(not args.no_record_video),
-                    video_fps=frequency,         # match the recording tick rate
                     save_raw_images=(not args.no_save_raw_images),
                 )
             recording_thread = RecordingThread(

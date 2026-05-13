@@ -177,12 +177,25 @@ def _select_mode(mode):
     return (mode or getattr(tc, "VISUALIZATION_MODE", "arrow")).lower()
 
 
+def _blend_overlay(drawn, original):
+    """Alpha-blend the drawn overlay onto the unmodified camera image.
+
+    Pixels that weren't touched by drawing are identical in both arrays so
+    blending leaves them unchanged; only the arrow/point/bar pixels get the
+    see-through effect.
+    """
+    alpha = float(getattr(tc, "ARROW_ALPHA", 1.0))
+    if alpha >= 0.999:
+        return drawn
+    return cv2.addWeighted(drawn, alpha, original, 1.0 - alpha, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------------------
 
 def _draw_arrows(img, anchors, magnitudes, connected, dirs_unit, valid=None,
-                 target_xy=None):
+                 target_xy=None, color=None):
     """In-place arrow drawing. img is a BGR ndarray (modified).
 
     anchors      : (N, 2) int pixel coords
@@ -205,6 +218,8 @@ def _draw_arrows(img, anchors, magnitudes, connected, dirs_unit, valid=None,
     n = len(anchors)
     if valid is None:
         valid = np.ones(n, dtype=bool)
+    if color is None:
+        color = tc.ARROW_COLOR_BGR
     min_visible = float(getattr(tc, "GRID_MIN_MAGNITUDE_VISIBLE", 0.0))
     frac_cap = float(getattr(tc, "AGGREGATE_ARROW_FRAC_CAP", 2.0))
 
@@ -228,14 +243,14 @@ def _draw_arrows(img, anchors, magnitudes, connected, dirs_unit, valid=None,
             dist = float(np.linalg.norm(target_xy - anchors[i].astype(np.float32)))
             length = min(length, dist * frac_cap)
         if length < tc.ARROW_MIN_LENGTH_PX:
-            cv2.circle(img, (u, v), 2, tc.ARROW_COLOR_BGR, -1)
+            cv2.circle(img, (u, v), 2, color, -1)
             continue
         # If the signed magnitude is negative, flip the arrow direction.
         sign = 1.0 if mag >= 0 else -1.0
         dx = float(dirs_unit[i, 0]) * length * sign
         dy = float(dirs_unit[i, 1]) * length * sign
         end = (int(round(u + dx)), int(round(v + dy)))
-        cv2.arrowedLine(img, (u, v), end, tc.ARROW_COLOR_BGR,
+        cv2.arrowedLine(img, (u, v), end, color,
                         tc.ARROW_THICKNESS, tipLength=tc.ARROW_TIP_LENGTH)
 
 
@@ -267,8 +282,10 @@ def _agent_grid(img_out, ee_pose, tact_L, tact_R, conn_L, conn_R, trc, intr):
     dirs_R = _unit_dirs(pix_R, center_L)
     mag_L = squeeze_magnitudes(tact_L, "left")
     mag_R = squeeze_magnitudes(tact_R, "right")
-    _draw_arrows(img_out, pix_L, mag_L, conn_L, dirs_L, valid=valid_L, target_xy=center_R)
-    _draw_arrows(img_out, pix_R, mag_R, conn_R, dirs_R, valid=valid_R, target_xy=center_L)
+    _draw_arrows(img_out, pix_L, mag_L, conn_L, dirs_L, valid=valid_L, target_xy=center_R,
+                 color=tc.LEFT_ARROW_COLOR_BGR)
+    _draw_arrows(img_out, pix_R, mag_R, conn_R, dirs_R, valid=valid_R, target_xy=center_L,
+                 color=tc.RIGHT_ARROW_COLOR_BGR)
 
 
 def _agent_arrow(img_out, ee_pose, tact_L, tact_R, conn_L, conn_R, trc, intr):
@@ -279,8 +296,8 @@ def _agent_arrow(img_out, ee_pose, tact_L, tact_R, conn_L, conn_R, trc, intr):
     cen_L = np.mean(pix_L[valid_L].astype(np.float32), axis=0)
     cen_R = np.mean(pix_R[valid_R].astype(np.float32), axis=0)
     mag_L, mag_R = _aggregate_per_finger(tact_L, tact_R)
-    _single_arrow_at(img_out, cen_L, cen_R, mag_L)
-    _single_arrow_at(img_out, cen_R, cen_L, mag_R)
+    _single_arrow_at(img_out, cen_L, cen_R, mag_L, color=tc.LEFT_ARROW_COLOR_BGR)
+    _single_arrow_at(img_out, cen_R, cen_L, mag_R, color=tc.RIGHT_ARROW_COLOR_BGR)
 
 
 def _agent_point(img_out, ee_pose, tact_L, tact_R, conn_L, conn_R, trc, intr):
@@ -288,12 +305,14 @@ def _agent_point(img_out, ee_pose, tact_L, tact_R, conn_L, conn_R, trc, intr):
     pix_L, valid_L, pix_R, valid_R = _agent_project_pixels(ee_pose, trc, intr)
     mag_L, mag_R = _aggregate_per_finger(tact_L, tact_R)
     if valid_L.any():
-        _single_point_at(img_out, np.mean(pix_L[valid_L].astype(np.float32), axis=0), mag_L)
+        _single_point_at(img_out, np.mean(pix_L[valid_L].astype(np.float32), axis=0), mag_L,
+                         color=tc.LEFT_ARROW_COLOR_BGR)
     if valid_R.any():
-        _single_point_at(img_out, np.mean(pix_R[valid_R].astype(np.float32), axis=0), mag_R)
+        _single_point_at(img_out, np.mean(pix_R[valid_R].astype(np.float32), axis=0), mag_R,
+                         color=tc.RIGHT_ARROW_COLOR_BGR)
 
 
-def _single_arrow_at(img, center, target, mag):
+def _single_arrow_at(img, center, target, mag, color=None):
     """Draw one arrow from `center` toward `target`, length scaled by mag.
 
     Returns without drawing if mag is below tc.AGGREGATE_MIN_MAGNITUDE_VISIBLE
@@ -301,6 +320,8 @@ def _single_arrow_at(img, center, target, mag):
     at AGGREGATE_MAX_LENGTH_PX AND at half the distance to `target` so
     opposing arrows from the two fingers don't overlap.
     """
+    if color is None:
+        color = tc.ARROW_COLOR_BGR
     min_visible = float(getattr(tc, "AGGREGATE_MIN_MAGNITUDE_VISIBLE", 0.0))
     if mag < min_visible:
         return
@@ -320,15 +341,17 @@ def _single_arrow_at(img, center, target, mag):
     end = (int(round(center[0] + unit[0] * length)),
            int(round(center[1] + unit[1] * length)))
     cv2.arrowedLine(img, (int(center[0]), int(center[1])), end,
-                    tc.ARROW_COLOR_BGR, tc.ARROW_THICKNESS,
+                    color, tc.ARROW_THICKNESS,
                     tipLength=tc.ARROW_TIP_LENGTH)
 
 
-def _single_point_at(img, center, mag):
+def _single_point_at(img, center, mag, color=None):
     """Draw one solid circle at `center` with radius scaled by mag.
 
     Returns without drawing if mag is below tc.AGGREGATE_MIN_MAGNITUDE_VISIBLE.
     """
+    if color is None:
+        color = tc.ARROW_COLOR_BGR
     min_visible = float(getattr(tc, "AGGREGATE_MIN_MAGNITUDE_VISIBLE", 0.0))
     if mag < min_visible:
         return
@@ -336,14 +359,14 @@ def _single_point_at(img, center, mag):
     max_len = float(getattr(tc, "AGGREGATE_MAX_LENGTH_PX", 250))
     radius = int(np.clip(mag * scale, 3, max_len))
     cv2.circle(img, (int(center[0]), int(center[1])),
-               radius, tc.ARROW_COLOR_BGR, -1)
+               radius, color, -1)
 
 
 def _bottom_bar(img_out, tact_L, tact_R):
     """Two horizontal binary bars at the bottom of the image.
 
-    Each bar is drawn green ONLY if that finger's aggregate is above
-    tc.BAR_TRIP_THRESHOLD; below threshold, nothing is drawn for that
+    Each bar lights up in its per-side color ONLY if that finger's aggregate
+    is above tc.BAR_TRIP_THRESHOLD; below threshold, nothing is drawn for that
     finger. (No gray placeholder — keeps the overlay clean when there's
     no contact, per the "hide-when-no-reading" rule.)
     """
@@ -353,19 +376,18 @@ def _bottom_bar(img_out, tact_L, tact_R):
     bar_h = max(20, h // 12)
     bar_w_each = (w // 2) - 20
     y0 = h - bar_h - 10
-    lit = (0, 220, 0)        # green
 
     if mag_L >= trip:
         x0 = 10
         cv2.rectangle(img_out, (x0, y0), (x0 + bar_w_each, y0 + bar_h),
-                      lit, -1)
+                      tc.LEFT_ARROW_COLOR_BGR, -1)
         cv2.putText(img_out, f"L  {int(mag_L)}",
                     (x0 + 8, y0 + bar_h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     if mag_R >= trip:
         x0 = (w // 2) + 10
         cv2.rectangle(img_out, (x0, y0), (x0 + bar_w_each, y0 + bar_h),
-                      lit, -1)
+                      tc.RIGHT_ARROW_COLOR_BGR, -1)
         cv2.putText(img_out, f"R  {int(mag_R)}",
                     (x0 + 8, y0 + bar_h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -390,7 +412,7 @@ def draw_agent_overlay(img, ee_pose, tactile_left_9x3, tactile_right_9x3,
         _bottom_bar(img_out, tactile_left_9x3, tactile_right_9x3)
     else:
         raise ValueError(f"unknown VISUALIZATION_MODE: {mode!r}")
-    return img_out
+    return _blend_overlay(img_out, img)
 
 
 def _wrist_anchors_for_finger(top_left_uv) -> np.ndarray:
@@ -424,8 +446,10 @@ def _wrist_grid(img_out, tact_L, tact_R, conn_L, conn_R):
     dirs_R = _unit_dirs(anchors_R, center_L)
     mag_L = squeeze_magnitudes(tact_L, "left")
     mag_R = squeeze_magnitudes(tact_R, "right")
-    _draw_arrows(img_out, anchors_L, mag_L, conn_L, dirs_L, target_xy=center_R)
-    _draw_arrows(img_out, anchors_R, mag_R, conn_R, dirs_R, target_xy=center_L)
+    _draw_arrows(img_out, anchors_L, mag_L, conn_L, dirs_L, target_xy=center_R,
+                 color=tc.LEFT_ARROW_COLOR_BGR)
+    _draw_arrows(img_out, anchors_R, mag_R, conn_R, dirs_R, target_xy=center_L,
+                 color=tc.RIGHT_ARROW_COLOR_BGR)
 
 
 def _wrist_arrow(img_out, tact_L, tact_R, conn_L, conn_R):
@@ -434,8 +458,8 @@ def _wrist_arrow(img_out, tact_L, tact_R, conn_L, conn_R):
     center_L = np.mean(anchors_L, axis=0).astype(np.float32)
     center_R = np.mean(anchors_R, axis=0).astype(np.float32)
     mag_L, mag_R = _aggregate_per_finger(tact_L, tact_R)
-    _single_arrow_at(img_out, center_L, center_R, mag_L)
-    _single_arrow_at(img_out, center_R, center_L, mag_R)
+    _single_arrow_at(img_out, center_L, center_R, mag_L, color=tc.LEFT_ARROW_COLOR_BGR)
+    _single_arrow_at(img_out, center_R, center_L, mag_R, color=tc.RIGHT_ARROW_COLOR_BGR)
 
 
 def _wrist_point(img_out, tact_L, tact_R, conn_L, conn_R):
@@ -444,8 +468,8 @@ def _wrist_point(img_out, tact_L, tact_R, conn_L, conn_R):
     center_L = np.mean(anchors_L, axis=0).astype(np.float32)
     center_R = np.mean(anchors_R, axis=0).astype(np.float32)
     mag_L, mag_R = _aggregate_per_finger(tact_L, tact_R)
-    _single_point_at(img_out, center_L, mag_L)
-    _single_point_at(img_out, center_R, mag_R)
+    _single_point_at(img_out, center_L, mag_L, color=tc.LEFT_ARROW_COLOR_BGR)
+    _single_point_at(img_out, center_R, mag_R, color=tc.RIGHT_ARROW_COLOR_BGR)
 
 
 def draw_wrist_overlay(img, tactile_left_9x3, tactile_right_9x3,
@@ -467,4 +491,4 @@ def draw_wrist_overlay(img, tactile_left_9x3, tactile_right_9x3,
         _bottom_bar(img_out, tactile_left_9x3, tactile_right_9x3)
     else:
         raise ValueError(f"unknown VISUALIZATION_MODE: {mode!r}")
-    return img_out
+    return _blend_overlay(img_out, img)

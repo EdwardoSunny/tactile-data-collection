@@ -1,11 +1,8 @@
-import os
 import numpy as np
 import zarr
 import threading
 import time
 from collections import deque
-
-import cv2
 
 
 # Compression settings. zstd is fast + ratios good for both images and small
@@ -21,7 +18,6 @@ _num_compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
 class DatasetRecorder:
     def __init__(self, path, memory_buffer_size=5000, flush_interval=1.0,
                  use_actions=True, use_tactile=False, tactile_baseline=None,
-                 record_videos=True, video_fps=10.0,
                  save_raw_images=True):
         self.path = path
         self.memory_buffer_size = memory_buffer_size
@@ -39,16 +35,6 @@ class DatasetRecorder:
         self.tactile_baseline = tactile_baseline
         self.num_cameras = None
         self.initialized = False
-
-        # Per-episode MP4 recording (sibling directory to the zarr). One mp4
-        # per camera per episode, opened on the first frame of an episode and
-        # closed on end_episode (or recorder shutdown).
-        self.record_videos = bool(record_videos)
-        self.video_fps = float(video_fps)
-        # videos live alongside the zarr: e.g.  teleop_data.zarr_videos/
-        self._video_dir = (path.rstrip("/") + "_videos") if self.record_videos else None
-        self._video_writers = {}        # camera_index -> cv2.VideoWriter (open during an episode)
-        self._video_episode_num = 0     # incremented on each new episode (1-based)
 
         self.memory_buffer = {
             'state': deque(maxlen=memory_buffer_size),
@@ -178,46 +164,6 @@ class DatasetRecorder:
         self.initialized = True
         self._start_flush_thread()
 
-        # Sync next episode number from existing zarr meta (so resume keeps counting).
-        if self.record_videos and self._video_dir:
-            try:
-                os.makedirs(self._video_dir, exist_ok=True)
-            except Exception as e:
-                print(f"  [warn] couldn't create video dir {self._video_dir}: {e}")
-                self.record_videos = False
-        if self.record_videos and "episode_ends" in meta:
-            try:
-                self._video_episode_num = int(meta["episode_ends"].shape[0])
-            except Exception:
-                self._video_episode_num = 0
-
-    def _open_video_writers(self, frame_hw):
-        """Open one VideoWriter per camera for the upcoming episode."""
-        if not self.record_videos or self.num_cameras is None:
-            return
-        self._video_episode_num += 1
-        ep = self._video_episode_num
-        h, w = int(frame_hw[0]), int(frame_hw[1])
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        for i in range(self.num_cameras):
-            video_path = os.path.join(
-                self._video_dir, f"ep_{ep:03d}_cam_{i}.mp4"
-            )
-            writer = cv2.VideoWriter(video_path, fourcc, self.video_fps, (w, h))
-            if writer.isOpened():
-                self._video_writers[i] = writer
-            else:
-                print(f"  [warn] couldn't open video writer at {video_path}; videos for this episode disabled")
-                writer.release()
-
-    def _close_video_writers(self):
-        for w in list(self._video_writers.values()):
-            try:
-                w.release()
-            except Exception:
-                pass
-        self._video_writers = {}
-            
     def _start_flush_thread(self):
         self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._flush_thread.start()
@@ -370,20 +316,7 @@ class DatasetRecorder:
             self.memory_buffer['action'].append(action)
         self.memory_buffer['n_contacts'].append(n_contacts)
 
-        # Open video writers lazily on the first frame of each new episode.
-        # An "episode" here = the run between end_episode() calls. We detect
-        # the start by checking that no writers are currently open AND there
-        # are camera frames to write.
-        if self.record_videos and not self._video_writers and len(imgs) > 0 and imgs[0] is not None:
-            self._open_video_writers(frame_hw=imgs[0].shape[:2])
-
         for i, img in enumerate(imgs):
-            # Write the (already-overlaid, uint8) frame to MP4 BEFORE normalizing for zarr.
-            if i in self._video_writers and img is not None:
-                try:
-                    self._video_writers[i].write(img)
-                except Exception as e:
-                    print(f"  [warn] video write failed for cam {i}: {e}")
             self.memory_buffer['imgs'][i].append(img / 255.0)
 
         # Raw (no-overlay) frames stored separately so post-hoc rendering or
@@ -420,8 +353,6 @@ class DatasetRecorder:
         relative_end = len(self.memory_buffer['state'])
         self.episode_ends_buffer.append(relative_end)
         self._ep_step_counter = 0
-        # Finalize this episode's MP4s; next append starts a new one.
-        self._close_video_writers()
 
     def discard_last_episode(self) -> int:
         """Remove the most recently completed episode from the dataset.
@@ -429,17 +360,10 @@ class DatasetRecorder:
         Flushes any in-memory data first so zarr matches in-memory state, then:
           - truncates every /data/* array back to the previous episode's end
           - pops the last entry from /meta/episode_ends
-          - deletes the mp4 files for that episode (cam_0, cam_1, ...)
-          - rewinds zarr_n and the video episode counter
+          - rewinds zarr_n
 
-        Refuses if an episode is currently in progress (caller should stop
-        recording with end_episode() first). Returns the number of frames
-        removed, or 0 if there was nothing to discard.
+        Returns the number of frames removed, or 0 if there was nothing to discard.
         """
-        if self._video_writers:
-            print("  [discard] in-progress episode — close it via end_episode() first.")
-            return 0
-
         # Make sure any pending append has hit disk before we truncate.
         self._flush_to_zarr()
 
@@ -470,18 +394,6 @@ class DatasetRecorder:
         # Rewind our running counter.
         self.zarr_n = last_start
 
-        # Delete the mp4 files for this episode and rewind the counter.
-        if self.record_videos and self._video_dir and self._video_episode_num > 0:
-            ep = self._video_episode_num
-            for i in range(self.num_cameras or 0):
-                p = os.path.join(self._video_dir, f"ep_{ep:03d}_cam_{i}.mp4")
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception as e:
-                    print(f"  [discard] couldn't remove {p}: {e}")
-            self._video_episode_num -= 1
-
         return n_removed
         # print(f"Episode ended at step {relative_end} (memory buffer)")  # disabled — collect_with_home.py prints its own per-episode summary
         
@@ -489,9 +401,6 @@ class DatasetRecorder:
         self._stop_flushing = True
         if self._flush_thread:
             self._flush_thread.join(timeout=5.0)
-
-        # Ensure any in-progress episode's MP4s are properly finalized.
-        self._close_video_writers()
 
         self._flush_to_zarr()
 

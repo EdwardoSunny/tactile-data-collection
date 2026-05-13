@@ -124,16 +124,16 @@ WRIST_CELL_PIX          = 35           # pixel spacing between adjacent cells
 # signal range is DELTA from idle. ARROW_SCALE controls visual sensitivity
 # only — it does NOT change the safety threshold or the recorded values.
 # Bumped so light contact produces visibly large arrows.
-ARROW_SCALE_PX_PER_UNIT = 0.4     # pixels per raw-count of delta-from-idle (per-cell, grid mode)
-ARROW_MAX_LENGTH_PX     = 80      # arrow cap at native res (~28 px after 224x224 resize)
+ARROW_SCALE_PX_PER_UNIT = 0.6     # pixels per raw-count of delta-from-idle (per-cell, grid mode)
+ARROW_MAX_LENGTH_PX     = 130     # arrow cap at native res (~45 px after 224x224 resize)
 ARROW_MIN_LENGTH_PX     = 4       # below this, draw a small dot instead of a line
 
 # For "arrow" and "point" modes the aggregation reduces the 9 cells to one
 # scalar per finger (see AGGREGATE_METHOD below). With AGGREGATE_METHOD="max"
 # the aggregate is the same kind of "per-cell delta" magnitude grid uses,
 # so we keep matching scale + cap. With "sum" drop the scale by ~10x.
-AGGREGATE_SCALE_PX_PER_UNIT = 0.4     # per-finger aggregate -> pixels
-AGGREGATE_MAX_LENGTH_PX     = 80      # cap at native res (~28 px after 224x224 resize)
+AGGREGATE_SCALE_PX_PER_UNIT = 0.6     # per-finger aggregate -> pixels
+AGGREGATE_MAX_LENGTH_PX     = 130     # cap at native res (~45 px after 224x224 resize)
 
 # Cap that clamps an arrow's length to FRAC * (pixel distance to the
 # target it points at). 0.5 = arrow head reaches at most the midpoint
@@ -160,9 +160,15 @@ AGGREGATE_METHOD = "max"
 # a tiny "ghost" arrow at rest. Set to 0 to draw everything.
 GRID_MIN_MAGNITUDE_VISIBLE       = 60.0   # per-cell threshold for grid mode
 AGGREGATE_MIN_MAGNITUDE_VISIBLE  = 60.0   # per-finger aggregate threshold for arrow + point modes
-ARROW_COLOR_BGR         = (0, 0, 255)     # red
-ARROW_THICKNESS         = 3
+# Per-side arrow colors. LEFT = ACM0, RIGHT = ACM1. BGR tuples.
+LEFT_ARROW_COLOR_BGR    = (0, 255, 0)     # green for LEFT (ACM0)
+RIGHT_ARROW_COLOR_BGR   = (0, 0, 255)     # red   for RIGHT (ACM1)
+ARROW_COLOR_BGR         = (0, 0, 255)     # legacy single-color fallback
+ARROW_THICKNESS         = 5
 ARROW_TIP_LENGTH        = 0.35    # fraction of the line, for cv2.arrowedLine
+# Alpha for blending the drawn overlay onto the camera image. 1.0 = fully
+# opaque (no see-through); 0.0 = invisible. ~0.75 = slightly transparent.
+ARROW_ALPHA             = 0.75
 
 DISCONNECTED_COLOR_BGR  = (128, 128, 128) # gray dot for cells reporting connected=0
 DISCONNECTED_RADIUS_PX  = 2
