@@ -113,10 +113,11 @@ class DatasetRecorder:
         if min_length == 0:
             return
         
-        if self.use_actions:
-            print(f"Flushing {min_length} steps (states: {len(states)}, actions: {len(actions)}, imgs: {[len(imgs[i]) for i in range(self.num_cameras)]})")
-        else:
-            print(f"Flushing {min_length} steps (states: {len(states)}, imgs: {[len(imgs[i]) for i in range(self.num_cameras)]})")
+        # Per-flush "Flushing N steps" print disabled — internal disk I/O, not relevant during recording.
+        # if self.use_actions:
+        #     print(f"Flushing {min_length} steps (states: {len(states)}, actions: {len(actions)}, imgs: {[len(imgs[i]) for i in range(self.num_cameras)]})")
+        # else:
+        #     print(f"Flushing {min_length} steps (states: {len(states)}, imgs: {[len(imgs[i]) for i in range(self.num_cameras)]})")
         
         states = states[:min_length]
         n_contacts = n_contacts[:min_length]
@@ -156,8 +157,8 @@ class DatasetRecorder:
             meta["episode_ends"][old_ep_size:new_ep_size] = adjusted_ends
             
         self.zarr_n = new_size
-        
-        print(f"Flushed {min_length} steps to zarr (total: {self.zarr_n})")
+
+        # print(f"Flushed {min_length} steps to zarr (total: {self.zarr_n})")  # disabled — see flush print above
         
     def append(self, state, n_contacts, imgs, action=None):
         if not self.initialized:
@@ -186,7 +187,7 @@ class DatasetRecorder:
         relative_end = len(self.memory_buffer['state'])
         self.episode_ends_buffer.append(relative_end)
         self._ep_step_counter = 0
-        print(f"Episode ended at step {relative_end} (memory buffer)")
+        # print(f"Episode ended at step {relative_end} (memory buffer)")  # disabled — collect_with_home.py prints its own per-episode summary
         
     def close(self):
         self._stop_flushing = True
@@ -194,5 +195,5 @@ class DatasetRecorder:
             self._flush_thread.join(timeout=5.0)
             
         self._flush_to_zarr()
-        
-        print(f"Saved {self.zarr_n} total steps to {self.path}")
+
+        # print(f"Saved {self.zarr_n} total steps to {self.path}")  # disabled — collect_with_home.py prints a richer end-of-session summary

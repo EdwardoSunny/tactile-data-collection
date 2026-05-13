@@ -43,11 +43,21 @@ if __name__ == "__main__":
     last_button_check = 0
     button_cooldown = 3.0
     last_button_state = False
+    episode_num = 0
 
-    print("Phone Button - Home robot, then start/stop recording" if args.record else "Phone Button - Disabled (no recording)")
-    print(f"Recording frequency: {frequency} Hz" if args.record else "Recording: Disabled")
-    # print("[Q] - Quit")  # disabled with keystroke_counter
-    print("[Ctrl+C] - Quit (graceful shutdown via KeyboardInterrupt handler)")
+    print()
+    print("=" * 60)
+    print("  READY")
+    print("=" * 60)
+    if args.record:
+        print(f"  Recording   : ON ({frequency:.0f} Hz)  ->  teleop_data.zarr")
+    else:
+        print(f"  Recording   : OFF  (pass --record to enable)")
+    print(f"  Reset pose  : pos=[400, 0, 290]  rot=[180, 0, 0]")
+    print(f"  Phone btn A : start / stop episode (robot homes first)")
+    print(f"  Ctrl+C      : quit and flush to disk")
+    print("=" * 60)
+    print()
 
     try:
         while True:
@@ -57,7 +67,8 @@ if __name__ == "__main__":
 
                 if args.record and button_state and not last_button_state:
                     if not recording_thread.is_recording():
-                        print("Homing robot to start pose...")
+                        episode_num += 1
+                        print(f"  -> Episode {episode_num}: homing...")
                         env.reset(duration=args.reset_duration)
                         for _ in range(5):
                             obs = env.get_obs()
@@ -71,11 +82,13 @@ if __name__ == "__main__":
                         # back to wherever the user was teleoperating before homing.
                         target_pose, grasp_state, _ = phone_thread.get_data()
                         recording_thread.set_recording(True)
-                        print("Started recording episode")
+                        print(f"     recording")
                     else:
+                        n_steps = recorder._ep_step_counter
                         recording_thread.set_recording(False)
                         recorder.end_episode()
-                        print("Stopped recording episode")
+                        print(f"     done ({n_steps} frames)")
+                        print()
                     last_button_check = time.monotonic()
 
                 last_button_state = button_state
@@ -109,13 +122,18 @@ if __name__ == "__main__":
             time.sleep(0.01)
 
     except KeyboardInterrupt:
-        print("Interrupted! Saving data...")
+        print()
+        print("Quitting...")
         if args.record:
             if recording_thread.is_recording():
+                n_steps = recorder._ep_step_counter
                 recorder.end_episode()
+                print(f"     done ({n_steps} frames)")
             recording_thread.stop()
             recording_thread.join(timeout=2.0)
             recorder.close()
+            print()
+            print(f"Saved {episode_num} episode(s) this session.  Dataset now has {recorder.zarr_n} frames in {recorder.path}.")
         phone_thread.stop()
         phone_thread.join(timeout=2.0)
         # keystroke_counter.stop()

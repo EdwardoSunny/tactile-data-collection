@@ -11,7 +11,7 @@ class XArmEnvironment:
         xarm_config = XArmConfig(use_gripper=use_gripper)
         self.xarm_config = xarm_config
         self.xarm = XArm(xarm_config)
-        self.bounds = np.array([[250.0, 800.0],[-600.0, 600.0],[50.0, 400.0]])
+        self.bounds = np.array([[250.0, 800.0],[-600.0, 600.0],[30.0, 380.0]])  # z shifted down 20 mm (was [50, 400])
         self.reset_position = reset_position if reset_position is not None else [461.148376, 0.0, 85.0]
         # None = legacy behavior of holding whatever rotation the arm currently has.
         self.reset_orientation = reset_orientation

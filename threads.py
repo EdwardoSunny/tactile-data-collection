@@ -105,8 +105,9 @@ class RecordingThread(threading.Thread):
                                 imgs=camera_imgs
                             )
                             
-                            actual_freq = 1.0 / (current_time - self.last_record_time)
-                            print(f"Real frequency: {actual_freq:.2f} Hz")
+                            # Per-tick frequency print disabled — was flooding the terminal at 10 Hz during recording.
+                            # actual_freq = 1.0 / (current_time - self.last_record_time)
+                            # print(f"Real frequency: {actual_freq:.2f} Hz")
                             
                         except Exception as e:
                             print(f"Error in recording thread: {e}")
