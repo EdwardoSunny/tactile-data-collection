@@ -86,14 +86,54 @@ FINGER_CLOSING_AXIS_EE = "y"
 # ---------------------------------------------------------------------------
 # Force interpretation
 # ---------------------------------------------------------------------------
-# User says: "when the gripper grabs something, the magnets get pushed INTO
-# the finger". So per cell, the squeeze signal is the B-component along the
-# axis perpendicular to the finger's inner face. Per the convention above,
-# that axis is x, signed +1 for left and -1 for right so both fingers
-# produce "positive when squeezed".
-FORCE_AXIS = "x"        # which of "x" / "y" / "z" maps to gripping pressure
-LEFT_FORCE_SIGN  = -1   # +1 or -1, flip if left-finger readings go negative when squeezed
-RIGHT_FORCE_SIGN = +1   # +1 or -1, flip if right-finger readings go negative when squeezed
+# Shear-aware overlay (current behavior in environment/tactile_overlay.py):
+#   - per-cell SHEAR  = (Bx-baseline_x, By-baseline_y) -> arrow DIRECTION
+#   - per-cell NORMAL = sign * (Bz-baseline_z)         -> arrow LENGTH
+#   The signed scalar uses LEFT/RIGHT_FORCE_SIGN below so both fingers
+#   produce "positive when squeezed".
+#
+# FORCE_AXIS is only consulted by the LEGACY single-axis squeeze_magnitudes()
+# helper (kept around for any external caller that hasn't migrated). The
+# shear-aware code reads sensor xyz directly.
+FORCE_AXIS = "x"        # legacy: which of "x" / "y" / "z" was the squeeze axis
+LEFT_FORCE_SIGN  = -1   # +1 or -1, flip if left-finger Bz goes negative when squeezed
+RIGHT_FORCE_SIGN = +1   # +1 or -1, flip if right-finger Bz goes negative when squeezed
+
+# 2x2 matrices mapping sensor-frame shear (sx, sy) to image-plane direction
+# (du, dv). For the WRIST view this is the only stage. For the AGENT view
+# the rotated (sx', sy') is then embedded as a 3D vector in EE frame
+# (sensor.x -> finger-width axis, sensor.y -> finger-length axis) and
+# projected through the camera — so this matrix only handles per-finger
+# sign/swap conventions, not the camera angle.
+#
+# Tune by inducing a known shear (slide a finger laterally on each sensor)
+# and flipping signs on the diagonal until the arrow points along the
+# direction you actually pushed the magnet.
+WRIST_SHEAR_LEFT_UV_FROM_SENSOR  = [[ 1.0, 0.0], [0.0, 1.0]]   # identity
+WRIST_SHEAR_RIGHT_UV_FROM_SENSOR = [[-1.0, 0.0], [0.0, 1.0]]   # mirror x
+AGENT_SHEAR_LEFT_FROM_SENSOR     = [[ 1.0, 0.0], [0.0, 1.0]]
+AGENT_SHEAR_RIGHT_FROM_SENSOR    = [[-1.0, 0.0], [0.0, 1.0]]
+
+# Soft deadband on per-cell shear magnitude (raw sensor counts of |Bx, By|
+# after baseline subtraction). Cells whose |shear| is below this contribute
+# ZERO direction; cells above lose this much from their magnitude. Kills the
+# "arrow rotates wildly on tiny noise" effect — direction-by-normalization is
+# discontinuous near zero, so without a deadband a 5-count noise vector
+# produces a full unit-direction arrow.
+#
+# Tune: 2-3x the per-axis noise floor. The boards used here run at ~5-10
+# counts/axis idle, so 50 cleanly cuts noise while still letting any real
+# shear through (which is typically in the hundreds). Crank higher for
+# steadier arrows; set to 0 to disable.
+SHEAR_DEADBAND = 50.0
+
+# Agent view: per-cell sensor count -> EE-frame millimeters when projecting
+# shear to image-plane direction. Smaller = shorter linearization step
+# (better local direction approximation, smaller pixel offsets); larger =
+# more pronounced per-cell magnitude differences in the projected image_dir.
+# This setting only affects the AGENT view; the wrist view passes sensor xy
+# straight through the per-finger 2x2 above.
+AGENT_SHEAR_MM_PER_COUNT = 0.02
 
 # ---------------------------------------------------------------------------
 # Wrist camera anchors (pixels in the NATIVE 640x480 wrist frame).
