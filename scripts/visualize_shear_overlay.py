@@ -1,7 +1,7 @@
 """
 Re-render the shear-aware tactile overlay on already-recorded zarr data.
 
-Pulls /data/img_*_raw (un-overlaid camera frames), /data/tactile (raw 9-cell
+Pulls /data/img_* (un-overlaid camera frames; legacy zarrs use /data/img_*_raw), /data/tactile (raw 9-cell
 xyz per finger), /data/state (xArm pose) and /meta/tactile_baseline (per-cell
 idle field) out of a recording, then redraws the overlay using the current
 environment/tactile_overlay.py logic — sensor (Bx, By) drives the arrow
@@ -94,23 +94,25 @@ def _load_dataset(path):
     if len(episode_ends) == 0:
         raise ValueError(f"{path} has no completed episodes")
 
-    # Prefer the un-overlaid frames; fall back to the overlay-burned-in frames
-    # with a warning (older recordings might not have *_raw).
+    # Current schema: /data/img_{i} is the raw frame. Legacy zarrs (recorded
+    # before the raw-only refactor) had /data/img_{i} = overlay and a separate
+    # /data/img_{i}_raw = un-overlaid; in that case fall back to the _raw key
+    # so we still get clean un-overlaid frames to draw on.
     cam_keys = []
-    using_raw = True
+    legacy_fallback = False
     for i in range(8):
-        if f"img_{i}_raw" in data:
-            cam_keys.append(f"img_{i}_raw")
-        elif f"img_{i}" in data:
+        if f"img_{i}" in data:
             cam_keys.append(f"img_{i}")
-            using_raw = False
+        elif f"img_{i}_raw" in data:
+            cam_keys.append(f"img_{i}_raw")
+            legacy_fallback = True
         else:
             break
     if not cam_keys:
         raise ValueError(f"{path}/data has no img_* arrays")
-    if not using_raw:
-        print(f"  [warn] {path} has no img_*_raw — using img_* (old overlay is "
-              f"already burned in). Pass --record --no-save-raw-images=False next time.")
+    if legacy_fallback:
+        print(f"  [info] {path} is a legacy zarr (img_*_raw present); "
+              f"using *_raw for un-overlaid frames.")
 
     state = data["state"]
     if state.shape[1] < 7:

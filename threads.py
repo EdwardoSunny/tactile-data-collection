@@ -2,8 +2,11 @@
 Background threads for the teleop loop:
   PhoneReadThread   — ~1 kHz poll of phone pose / grasp / button under a lock.
   RecordingThread   — fixed-Hz sampler that pulls env.get_obs() + tactile state,
-                      optionally draws force overlays, downsizes images to
-                      224x224, and hands the frame to the DatasetRecorder.
+                      downsizes images to 224x224, and hands the RAW frame
+                      to the DatasetRecorder. Force overlays are drawn on a
+                      separate copy for the live --viz windows only; the
+                      recorded zarr never contains overlay-burned pixels.
+                      Post-hoc overlay rendering is scripts/render_overlays.py.
 """
 from __future__ import annotations
 
@@ -243,38 +246,39 @@ class RecordingThread(threading.Thread):
 
         agent_img_raw, wrist_img_raw = self._pick_cameras(obs)
         # Defensive copies — _pick_cameras may return numpy views over rs
-        # frame buffers that get recycled. Also keep these as the "raw" copy
-        # before any overlay drawing.
+        # frame buffers that get recycled. The recorder only ever sees these
+        # raw versions; the overlay below is purely for live --viz.
         if agent_img_raw is not None:
             agent_img_raw = agent_img_raw.copy()
         if wrist_img_raw is not None:
             wrist_img_raw = wrist_img_raw.copy()
-        agent_img = None if agent_img_raw is None else agent_img_raw.copy()
-        wrist_img = None if wrist_img_raw is None else wrist_img_raw.copy()
 
-        # Overlay is drawn on the native-resolution image, BEFORE the 224x224 resize.
+        # Live viz overlay. Drawn on separate copies so the recorder's raw
+        # frames stay un-touched. Skipped entirely when tactile is off or
+        # the operator passed --no-viz-overlay (draw_overlay=False).
+        agent_viz = None if agent_img_raw is None else agent_img_raw.copy()
+        wrist_viz = None if wrist_img_raw is None else wrist_img_raw.copy()
         if self.use_tactile and self.draw_overlay:
-            if agent_img is not None and self.trc_agent is not None and self.intrinsics_agent is not None:
-                agent_img = tactile_overlay.draw_agent_overlay(
-                    agent_img, obs["pose"],
+            if agent_viz is not None and self.trc_agent is not None and self.intrinsics_agent is not None:
+                agent_viz = tactile_overlay.draw_agent_overlay(
+                    agent_viz, obs["pose"],
                     vals_L, vals_R, conn_L, conn_R,
                     self.trc_agent, self.intrinsics_agent,
                     mode=self.viz_mode,
                 )
-            if wrist_img is not None:
-                wrist_img = tactile_overlay.draw_wrist_overlay(
-                    wrist_img, vals_L, vals_R, conn_L, conn_R,
+            if wrist_viz is not None:
+                wrist_viz = tactile_overlay.draw_wrist_overlay(
+                    wrist_viz, vals_L, vals_R, conn_L, conn_R,
                     mode=self.viz_mode,
                 )
 
         # Cache native-res overlaid frames for live viz consumers.
         with self._viz_lock:
-            self._latest_agent_viz = None if agent_img is None else agent_img.copy()
-            self._latest_wrist_viz = None if wrist_img is None else wrist_img.copy()
+            self._latest_agent_viz = None if agent_viz is None else agent_viz.copy()
+            self._latest_wrist_viz = None if wrist_viz is None else wrist_viz.copy()
             self._latest_viz_time = time.monotonic()
 
-        return (state, agent_img, wrist_img,
-                agent_img_raw, wrist_img_raw,
+        return (state, agent_img_raw, wrist_img_raw,
                 tactile_values, tactile_connected, ts_arr, lag_arr)
 
     def _record_one_tick(self):
@@ -282,12 +286,13 @@ class RecordingThread(threading.Thread):
 
         No-op when recorder is None (viz-only mode). Resize-to-224 happens here
         so the recorder only ever sees 224x224 frames regardless of camera res.
+        Recorder always receives RAW (un-overlaid) images; any overlay rendering
+        happens after the fact via scripts/render_overlays.py.
         """
         result = self._compute_tick()
         if result is None or self.recorder is None:
             return
-        (state, agent_img, wrist_img,
-         agent_img_raw, wrist_img_raw,
+        (state, agent_img_raw, wrist_img_raw,
          tactile_values, tactile_connected, ts_arr, lag_arr) = result
 
         # Race guard: the main thread may have called set_recording(False)
@@ -306,15 +311,13 @@ class RecordingThread(threading.Thread):
                 return np.zeros((224, 224, 3), dtype=np.uint8)
             return cv2.resize(img, (224, 224))
 
-        camera_imgs     = [_to_224(agent_img),     _to_224(wrist_img)]
-        camera_imgs_raw = [_to_224(agent_img_raw), _to_224(wrist_img_raw)]
+        camera_imgs = [_to_224(agent_img_raw), _to_224(wrist_img_raw)]
 
         if tactile_values is not None:
             self.recorder.append(
                 state=state,
                 n_contacts=np.array([0]),
                 imgs=camera_imgs,
-                imgs_raw=camera_imgs_raw,
                 tactile=tactile_values,
                 tactile_connected=tactile_connected,
                 tactile_ts_ms=ts_arr,
@@ -325,7 +328,6 @@ class RecordingThread(threading.Thread):
                 state=state,
                 n_contacts=np.array([0]),
                 imgs=camera_imgs,
-                imgs_raw=camera_imgs_raw,
             )
 
     def get_latest_viz(self):

@@ -214,9 +214,9 @@ DISCONNECTED_COLOR_BGR  = (128, 128, 128) # gray dot for cells reporting connect
 DISCONNECTED_RADIUS_PX  = 2
 
 # ---------------------------------------------------------------------------
-# Visualization mode (controls live --viz windows + the burned-in overlay
-# saved into /data/img_*). Raw camera frames are always also saved to
-# /data/img_*_raw so the mode can be changed post hoc when re-rendering.
+# Visualization mode (controls live --viz windows only). The recorded zarr
+# stores RAW frames only; scripts/render_overlays.py renders all four modes
+# into a separate teleop_data_overlay.zarr post-hoc.
 #
 #   "arrow"  one inward-pointing arrow per finger, length = per-finger
 #            aggregate squeeze magnitude. (Default — least noisy.)

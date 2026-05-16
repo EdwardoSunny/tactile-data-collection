@@ -1,3 +1,22 @@
+"""
+Raw-only dataset recorder.
+
+This module records the unprocessed data needed to (a) train policies and
+(b) regenerate any number of visualization overlays after the fact:
+  - 224x224 camera images, no overlay drawn on them
+  - robot state (xyz + euler + grasp), 7-dim
+  - per-board raw tactile xyz / connected / device-side ts / host-lag
+  - episode_ends in /meta
+
+Camera identity (serial, native intrinsics, native size, which serial is the
+agent vs the wrist) and the agent's robot->camera extrinsic (trc) are saved
+once into /meta so scripts/render_overlays.py can reproject without needing
+the live RealSense or the transforms_agent.npz file.
+
+The previous img_{i}_raw mirror arrays and the save_raw_images flag are gone:
+img_{i} IS the raw frame now. Overlay images live in a separate zarr
+produced by scripts/render_overlays.py.
+"""
 import numpy as np
 import zarr
 import threading
@@ -18,21 +37,30 @@ _num_compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
 class DatasetRecorder:
     def __init__(self, path, memory_buffer_size=5000, flush_interval=1.0,
                  use_actions=True, use_tactile=False, tactile_baseline=None,
-                 save_raw_images=True):
+                 camera_metadata=None):
+        """
+        Args:
+            camera_metadata: optional dict written once to /meta when the
+                store is first initialized. Expected keys (all optional, but
+                strongly recommended for render_overlays.py to work):
+                  - serials             : list[str], len = num_cameras
+                  - intrinsics_native   : (num_cameras, 4) [fx, fy, ppx, ppy]
+                  - native_size         : (num_cameras, 2) [width, height]
+                  - agent_serial        : str
+                  - wrist_serial        : str
+                  - trc_agent           : (3, 4) robot -> agent-camera transform
+                  - recorded_img_size   : (2,) [width, height]; defaults to (224, 224)
+        """
         self.path = path
         self.memory_buffer_size = memory_buffer_size
         self.flush_interval = flush_interval
         self.use_actions = use_actions
         self.use_tactile = use_tactile
-        # When True we also store /data/img_{i}_raw arrays containing the
-        # un-overlaid frames, so training / re-rendering can pick raw vs
-        # overlay at any time. The overlay-burned /data/img_{i} is always
-        # saved either way (it's the "live" visualization).
-        self.save_raw_images = bool(save_raw_images)
         # Optional per-cell idle baseline (n_sensors, n_taxels, 3). Saved
         # once to /meta/tactile_baseline so downstream code can subtract it
         # to get a delta-from-idle view of /data/tactile (which stays raw).
         self.tactile_baseline = tactile_baseline
+        self.camera_metadata = camera_metadata or {}
         self.num_cameras = None
         self.initialized = False
 
@@ -40,7 +68,6 @@ class DatasetRecorder:
             'state': deque(maxlen=memory_buffer_size),
             'n_contacts': deque(maxlen=memory_buffer_size),
             'imgs': [],
-            'imgs_raw': [],  # populated only if save_raw_images
         }
         if self.use_actions:
             self.memory_buffer['action'] = deque(maxlen=memory_buffer_size)
@@ -51,26 +78,24 @@ class DatasetRecorder:
             self.memory_buffer['tactile_ts_ms']     = deque(maxlen=memory_buffer_size)
             self.memory_buffer['tactile_lag_ms']    = deque(maxlen=memory_buffer_size)
         self.episode_ends_buffer = deque()
-        
+
         self._ep_step_counter = 0
         self._total_steps = 0
-        
+
         self._flush_thread = None
         self._stop_flushing = False
-        
+
         self.store = None
         self.zarr_n = 0
-        
+
     def _init_zarr_store(self, state_dim, act_dim, img_shapes):
         self.store = zarr.open(self.path, mode="a")
         data = self.store.require_group("data")
         meta = self.store.require_group("meta")
-        
+
         self.num_cameras = len(img_shapes)
         self.memory_buffer['imgs'] = [deque(maxlen=self.memory_buffer_size) for _ in range(self.num_cameras)]
-        if self.save_raw_images:
-            self.memory_buffer['imgs_raw'] = [deque(maxlen=self.memory_buffer_size) for _ in range(self.num_cameras)]
-        
+
         if "state" in data:
             self.zarr_n = data["state"].shape[0]
             print(f"Resuming existing dataset at step {self.zarr_n}")
@@ -93,12 +118,6 @@ class DatasetRecorder:
                     chunks=(32, *img_shape), dtype=np.float32,
                     compressor=_img_compressor,
                 )
-                if self.save_raw_images:
-                    data.create_dataset(
-                        f"img_{i}_raw", shape=(0, *img_shape),
-                        chunks=(32, *img_shape), dtype=np.float32,
-                        compressor=_img_compressor,
-                    )
             data.create_dataset(
                 "n_contacts", shape=(0, 1),
                 chunks=(1024, 1), dtype=np.float32,
@@ -154,36 +173,79 @@ class DatasetRecorder:
                     )
                     meta["tactile_baseline"][:] = baseline_arr
 
+        # Save camera metadata once. Used by scripts/render_overlays.py to
+        # reproject sensor positions onto the recorded frames without needing
+        # the live RealSense or transforms_agent.npz available at render time.
+        # Idempotent: only written if missing.
+        self._save_camera_metadata(meta)
+
         if "episode_ends" not in meta:
             meta.create_dataset(
                 "episode_ends", shape=(0,),
                 chunks=(1024,), dtype=np.int64,
                 compressor=_num_compressor,
             )
-        
+
         self.initialized = True
         self._start_flush_thread()
+
+    def _save_camera_metadata(self, meta):
+        cm = self.camera_metadata
+        if not cm:
+            return
+        # Strings as a JSON-ish object array. zarr can store object arrays;
+        # we use np.object_ via .astype(str).
+        def _set(name, arr, dtype=None):
+            arr = np.asarray(arr)
+            if dtype is not None:
+                arr = arr.astype(dtype)
+            if name in meta:
+                # Overwrite only if shape changed.
+                if meta[name].shape != arr.shape:
+                    del meta[name]
+                else:
+                    meta[name][...] = arr
+                    return
+            meta.create_dataset(name, shape=arr.shape, dtype=arr.dtype)
+            meta[name][...] = arr
+
+        if "serials" in cm:
+            # Strings -> fixed-width bytes for zarr-portability.
+            serials = np.array([str(s) for s in cm["serials"]], dtype="S64")
+            _set("camera_serials", serials)
+        if "intrinsics_native" in cm:
+            _set("camera_intrinsics_native", cm["intrinsics_native"], dtype=np.float32)
+        if "native_size" in cm:
+            _set("camera_native_size", cm["native_size"], dtype=np.int32)
+        if "agent_serial" in cm:
+            _set("agent_camera_serial",
+                 np.array(str(cm["agent_serial"]), dtype="S64"))
+        if "wrist_serial" in cm:
+            _set("wrist_camera_serial",
+                 np.array(str(cm["wrist_serial"]), dtype="S64"))
+        if "trc_agent" in cm and cm["trc_agent"] is not None:
+            _set("trc_agent", cm["trc_agent"], dtype=np.float64)
+        recorded = cm.get("recorded_img_size", (224, 224))
+        _set("recorded_img_size", recorded, dtype=np.int32)
 
     def _start_flush_thread(self):
         self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._flush_thread.start()
-        
+
     def _flush_loop(self):
         while not self._stop_flushing:
             time.sleep(self.flush_interval)
             self._flush_to_zarr()
-            
+
     def _flush_to_zarr(self):
         if not self.memory_buffer['state']:
             return
-            
+
         states = list(self.memory_buffer['state'])
         n_contacts = list(self.memory_buffer['n_contacts'])
         if self.use_actions:
             actions = list(self.memory_buffer['action'])
         imgs = [list(self.memory_buffer['imgs'][i]) for i in range(self.num_cameras)]
-        if self.save_raw_images:
-            imgs_raw = [list(self.memory_buffer['imgs_raw'][i]) for i in range(self.num_cameras)]
         if self.use_tactile:
             tactile           = list(self.memory_buffer['tactile'])
             tactile_connected = list(self.memory_buffer['tactile_connected'])
@@ -197,8 +259,6 @@ class DatasetRecorder:
             self.memory_buffer['action'].clear()
         for i in range(self.num_cameras):
             self.memory_buffer['imgs'][i].clear()
-            if self.save_raw_images:
-                self.memory_buffer['imgs_raw'][i].clear()
         if self.use_tactile:
             self.memory_buffer['tactile'].clear()
             self.memory_buffer['tactile_connected'].clear()
@@ -215,29 +275,18 @@ class DatasetRecorder:
         min_length = min(min_length, len(n_contacts))
         if self.num_cameras > 0:
             min_length = min(min_length, min(len(imgs[i]) for i in range(self.num_cameras)))
-            if self.save_raw_images:
-                min_length = min(min_length,
-                                 min(len(imgs_raw[i]) for i in range(self.num_cameras)))
         if self.use_tactile:
             min_length = min(min_length, len(tactile), len(tactile_connected),
                              len(tactile_ts_ms), len(tactile_lag_ms))
-            
+
         if min_length == 0:
             return
-        
-        # Per-flush "Flushing N steps" print disabled — internal disk I/O, not relevant during recording.
-        # if self.use_actions:
-        #     print(f"Flushing {min_length} steps (states: {len(states)}, actions: {len(actions)}, imgs: {[len(imgs[i]) for i in range(self.num_cameras)]})")
-        # else:
-        #     print(f"Flushing {min_length} steps (states: {len(states)}, imgs: {[len(imgs[i]) for i in range(self.num_cameras)]})")
-        
+
         states = states[:min_length]
         n_contacts = n_contacts[:min_length]
         if self.use_actions:
             actions = actions[:min_length]
         imgs = [img_list[:min_length] for img_list in imgs]
-        if self.save_raw_images:
-            imgs_raw = [img_list[:min_length] for img_list in imgs_raw]
         if self.use_tactile:
             tactile           = tactile[:min_length]
             tactile_connected = tactile_connected[:min_length]
@@ -249,17 +298,15 @@ class DatasetRecorder:
         if self.use_actions:
             actions_array = np.array(actions)
         imgs_arrays = [np.array(img_list) for img_list in imgs]
-        if self.save_raw_images:
-            imgs_raw_arrays = [np.array(img_list) for img_list in imgs_raw]
         if self.use_tactile:
             tactile_arr           = np.asarray(tactile,           dtype=np.float32)
             tactile_connected_arr = np.asarray(tactile_connected, dtype=np.uint8)
             tactile_ts_ms_arr     = np.asarray(tactile_ts_ms,     dtype=np.int64)
             tactile_lag_ms_arr    = np.asarray(tactile_lag_ms,    dtype=np.float32)
-        
+
         data = self.store["data"]
         meta = self.store["meta"]
-        
+
         new_size = self.zarr_n + min_length
         data["state"].resize((new_size, data["state"].shape[1]))
         if self.use_actions:
@@ -267,8 +314,6 @@ class DatasetRecorder:
         data["n_contacts"].resize((new_size, data["n_contacts"].shape[1]))
         for i in range(self.num_cameras):
             data[f"img_{i}"].resize((new_size, *data[f"img_{i}"].shape[1:]))
-            if self.save_raw_images and f"img_{i}_raw" in data:
-                data[f"img_{i}_raw"].resize((new_size, *data[f"img_{i}_raw"].shape[1:]))
         if self.use_tactile:
             data["tactile"].resize((new_size, *data["tactile"].shape[1:]))
             data["tactile_connected"].resize((new_size, *data["tactile_connected"].shape[1:]))
@@ -281,29 +326,24 @@ class DatasetRecorder:
         data["n_contacts"][self.zarr_n:new_size] = n_contacts_array
         for i in range(self.num_cameras):
             data[f"img_{i}"][self.zarr_n:new_size] = imgs_arrays[i]
-            if self.save_raw_images and f"img_{i}_raw" in data:
-                data[f"img_{i}_raw"][self.zarr_n:new_size] = imgs_raw_arrays[i]
         if self.use_tactile:
             data["tactile"][self.zarr_n:new_size]           = tactile_arr
             data["tactile_connected"][self.zarr_n:new_size] = tactile_connected_arr
             data["tactile_ts_ms"][self.zarr_n:new_size]     = tactile_ts_ms_arr
             data["tactile_lag_ms"][self.zarr_n:new_size]    = tactile_lag_ms_arr
-            
+
         if episode_ends:
             old_ep_size = meta["episode_ends"].shape[0]
             new_ep_size = old_ep_size + len(episode_ends)
             meta["episode_ends"].resize((new_ep_size,))
             adjusted_ends = [ep + self.zarr_n for ep in episode_ends]
             meta["episode_ends"][old_ep_size:new_ep_size] = adjusted_ends
-            
+
         self.zarr_n = new_size
 
-        # print(f"Flushed {min_length} steps to zarr (total: {self.zarr_n})")  # disabled — see flush print above
-        
     def append(self, state, n_contacts, imgs, action=None,
                tactile=None, tactile_connected=None,
-               tactile_ts_ms=None, tactile_lag_ms=None,
-               imgs_raw=None):
+               tactile_ts_ms=None, tactile_lag_ms=None):
         if not self.initialized:
             state_dim = len(state)
             act_dim = len(action) if action is not None else 1
@@ -318,14 +358,6 @@ class DatasetRecorder:
 
         for i, img in enumerate(imgs):
             self.memory_buffer['imgs'][i].append(img / 255.0)
-
-        # Raw (no-overlay) frames stored separately so post-hoc rendering or
-        # training can pick raw vs overlay. Falls back to `imgs` if caller
-        # didn't pass raw versions (shapes stay aligned either way).
-        if self.save_raw_images:
-            raw_source = imgs_raw if imgs_raw is not None else imgs
-            for i, img in enumerate(raw_source):
-                self.memory_buffer['imgs_raw'][i].append(img / 255.0)
 
         if self.use_tactile:
             # Caller is required to pass all four tactile fields when use_tactile=True.
@@ -344,11 +376,11 @@ class DatasetRecorder:
 
         self._ep_step_counter += 1
         self._total_steps += 1
-        
+
         if len(self.memory_buffer['state']) >= self.memory_buffer_size * 0.8:
             print(f"Memory buffer getting full ({len(self.memory_buffer['state'])}/{self.memory_buffer_size}), forcing flush...")
             self._flush_to_zarr()
-        
+
     def end_episode(self):
         relative_end = len(self.memory_buffer['state'])
         self.episode_ends_buffer.append(relative_end)
@@ -395,13 +427,10 @@ class DatasetRecorder:
         self.zarr_n = last_start
 
         return n_removed
-        # print(f"Episode ended at step {relative_end} (memory buffer)")  # disabled — collect_with_home.py prints its own per-episode summary
-        
+
     def close(self):
         self._stop_flushing = True
         if self._flush_thread:
             self._flush_thread.join(timeout=5.0)
 
         self._flush_to_zarr()
-
-        # print(f"Saved {self.zarr_n} total steps to {self.path}")  # disabled — collect_with_home.py prints a richer end-of-session summary
