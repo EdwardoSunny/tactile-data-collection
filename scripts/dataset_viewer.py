@@ -1,9 +1,42 @@
+import argparse
+import re
 import zarr
 import numpy as np
 import cv2
 import time
 
 DATA_PATH = "teleop_data.zarr"
+
+# A bare-camera image key is exactly "img_<digit(s)>" (e.g. img_0, img_1).
+# Overlay-augmented arrays are "img_<digit(s)>_<mode>" (e.g. img_0_arrow).
+_BARE_IMG_RE = re.compile(r"^img_(\d+)$")
+_VARIANT_IMG_RE = re.compile(r"^img_(\d+)_(\w+)$")
+
+
+def _bare_camera_indices(data):
+    """Return sorted list of camera indices that have a bare img_{i} array."""
+    idxs = []
+    for k in data.keys():
+        m = _BARE_IMG_RE.match(k)
+        if m:
+            idxs.append(int(m.group(1)))
+    return sorted(idxs)
+
+
+def _available_modes(data):
+    """Return ['raw'] + sorted list of overlay suffixes found in data.
+    'raw' always comes first; the others come from the img_{i}_<mode> arrays
+    (the same mode set is assumed for every camera that has variants)."""
+    modes = set()
+    for k in data.keys():
+        m = _VARIANT_IMG_RE.match(k)
+        if m:
+            modes.add(m.group(2))
+    return ["raw"] + sorted(modes)
+
+
+def _img_key_for(cam_idx, mode):
+    return f"img_{cam_idx}" if mode == "raw" else f"img_{cam_idx}_{mode}"
 
 
 def delete_episode(episode_idx):
@@ -181,87 +214,111 @@ def load_dataset_lazy(path):
     return store, data, meta
 
 
-def get_episode_data(data, episode_idx, episode_ends):
+def get_episode_data(data, episode_idx, episode_ends, mode="raw"):
+    """Return (imgs, states) for one episode.
+
+    `imgs` is the per-frame N-camera frames concatenated horizontally. `mode`
+    selects which image array to read for each camera:
+        "raw"   -> data["img_{i}"]
+        "arrow" -> data["img_{i}_arrow"]   (and same for grid / point / bar)
+    Falls back to the legacy single-camera 'img' key only if no img_{i} exists.
+    """
     starts = np.concatenate([[0], episode_ends[:-1]])
     start_idx = starts[episode_idx]
     end_idx = episode_ends[episode_idx]
-    print(list(data.keys()))
     episode_states = np.array(data["state"][start_idx:end_idx])
-    
-    img_keys = [key for key in data.keys() if key.startswith('img')]
-    if 'img_0' in img_keys:
+
+    cam_idxs = _bare_camera_indices(data)
+    if cam_idxs:
         imgs_list = []
-        for i in range(len([k for k in img_keys if k.startswith('img_')])):
-            imgs_list.append(np.array(data[f"img_{i}"][start_idx:end_idx]))
+        for i in cam_idxs:
+            key = _img_key_for(i, mode)
+            if key not in data:
+                # Mode unavailable for this camera; fall back to raw.
+                key = f"img_{i}"
+            imgs_list.append(np.array(data[key][start_idx:end_idx]))
         episode_imgs = np.concatenate(imgs_list, axis=2)
-    else:
+    elif "img" in data:
         episode_imgs = np.array(data["img"][start_idx:end_idx])
-    
+    else:
+        raise KeyError("dataset has no img_* arrays")
+
     return episode_imgs, episode_states
 
 
-def play_dataset_lazy(store, data, meta):
+def play_dataset_lazy(store, data, meta, mode="raw"):
     episode_ends = np.array(meta["episode_ends"])
-    
+
     if len(episode_ends) == 0:
         print("❌ No episodes found in dataset!")
         return False
 
+    modes_available = _available_modes(data)
+    # Mode keys we listen for. Always include all modes the dataset has so the
+    # user can flip between raw + overlays without re-running.
+    _MODE_KEYS = {"r": "raw", "a": "arrow", "g": "grid", "p": "point", "b": "bar"}
+
     ep_idx = 0
     frame_idx = 0
     playing = True
-    
+
     current_episode_data = None
     current_ep_idx = -1
+    current_mode = mode if mode in modes_available else "raw"
 
     print(f"▶️ Loaded {len(episode_ends)} episodes total")
+    print(f"Available image modes: {modes_available}  (currently: {current_mode})")
     print("Controls:")
-    print("  SPACE - pause/play")
-    print("  LEFT ARROW - previous episode")
-    print("  RIGHT ARROW - next episode") 
+    print("  SPACE        - pause/play")
+    print("  LEFT ARROW   - previous episode")
+    print("  RIGHT ARROW  - next episode")
+    print("  r / a / g / p / b - switch view: raw / arrow / grid / point / bar")
     print("  'd' - delete current episode")
     print("  'q' - quit")
 
     while True:
-        if ep_idx != current_ep_idx:
-            print(f"Loading episode {ep_idx + 1}...")
-            current_episode_data = get_episode_data(data, ep_idx, episode_ends)
+        # Reload when episode OR mode changes.
+        if ep_idx != current_ep_idx or current_episode_data is None:
+            print(f"Loading episode {ep_idx + 1} (mode={current_mode})...")
+            current_episode_data = get_episode_data(
+                data, ep_idx, episode_ends, mode=current_mode
+            )
             current_ep_idx = ep_idx
             frame_idx = 0
-            
+
         if current_episode_data is None:
             break
-            
+
         imgs, states = current_episode_data
         episode_length = len(imgs)
-        
+
         if frame_idx >= episode_length:
             frame_idx = 0
-            
+
         state = states[frame_idx]
         pose = state[:]
         # grasp = state[-1]
-        
+
         frame = np.clip(imgs[frame_idx] * 255, 0, 255).astype(np.uint8)
-        
+
         display_frame = frame.copy()
         h, w = display_frame.shape[:2]
-        
+
         text_lines = [
-            f"Episode {ep_idx + 1}/{len(episode_ends)} | Frame {frame_idx + 1}/{episode_length}",
+            f"Episode {ep_idx + 1}/{len(episode_ends)} | Frame {frame_idx + 1}/{episode_length} | mode={current_mode}",
             f"Pose: [{', '.join([f'{p:.1f}' for p in pose])}]",
             # f"Grasp: {'CLOSED' if grasp > 0.5 else 'OPEN'} ({grasp:.2f})"
         ]
-        
+
         y_offset = 25
         for i, text in enumerate(text_lines):
-            cv2.putText(display_frame, text, (10, y_offset + i * 20), 
+            cv2.putText(display_frame, text, (10, y_offset + i * 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        
+
         cv2.imshow("Dataset Playback", display_frame)
-        
+
         key = cv2.waitKey(1) & 0xFF
-        
+
         if key == ord('q') or key == 27:
             break
         elif key == ord(' '):
@@ -273,6 +330,16 @@ def play_dataset_lazy(store, data, meta):
         elif key == 81:
             ep_idx = (ep_idx - 1) % len(episode_ends)
             print(f"⬅️ Episode {ep_idx + 1}/{len(episode_ends)}")
+        elif key < 128 and chr(key) in _MODE_KEYS:
+            requested = _MODE_KEYS[chr(key)]
+            if requested in modes_available:
+                if requested != current_mode:
+                    current_mode = requested
+                    current_episode_data = None  # force reload
+                    print(f"🎨 Switched view to: {current_mode}")
+            else:
+                print(f"  [skip] '{requested}' not available in this dataset "
+                      f"(have: {modes_available})")
         elif key == ord('d'):
             print(f"⚠️ Delete episode {ep_idx + 1}? Press 'y' to confirm, any other key to cancel")
             confirm_key = cv2.waitKey(0) & 0xFF
@@ -295,39 +362,48 @@ def play_dataset_lazy(store, data, meta):
     return False
 
 
-def main():
+def main(path=None, mode="raw"):
+    global DATA_PATH
+    if path is not None:
+        DATA_PATH = path
+
     try:
         store, data, meta = load_dataset_lazy(DATA_PATH)
-        
+
         episode_ends = np.array(meta["episode_ends"])
-        
+        cam_idxs = _bare_camera_indices(data)
+        modes_available = _available_modes(data)
+
         print(f"📊 Dataset Statistics:")
+        print(f"  Path: {DATA_PATH}")
         print(f"  Total frames: {data['state'].shape[0] if 'state' in data else 0}")
         print(f"  Episodes: {len(episode_ends)}")
-        
+
         if 'state' in data:
-            print(f"  Image shape: {data['img_0'].shape[1:] if 'img_0' in data else data['img'].shape[1:] if 'img' in data else 'Unknown'}")
+            sample_key = f"img_{cam_idxs[0]}" if cam_idxs else ("img" if "img" in data else None)
+            shape_str = data[sample_key].shape[1:] if sample_key else "Unknown"
+            print(f"  Image shape: {shape_str}")
             print(f"  State dim: {data['state'].shape[1]}")
-        
-        img_keys = [key for key in data.keys() if key.startswith('img')]
-        if 'img_0' in img_keys:
-            print(f"  Number of cameras: {len([k for k in img_keys if k.startswith('img_')])}")
-        
+
+        if cam_idxs:
+            print(f"  Cameras: {cam_idxs}  ({len(cam_idxs)} bare img_* arrays)")
+        print(f"  Available view modes: {modes_available}")
+
         if len(episode_ends) > 0:
             episode_lengths = np.diff(np.concatenate([[0], episode_ends]))
             print(f"  Episode lengths: {episode_lengths}")
             print(f"  Avg episode length: {np.mean(episode_lengths):.1f} frames")
         else:
             print("  No complete episodes recorded yet")
-        
+
         if len(episode_ends) > 0:
-            should_reload = play_dataset_lazy(store, data, meta)
+            should_reload = play_dataset_lazy(store, data, meta, mode=mode)
             if should_reload:
                 print("🔄 Reloading dataset...")
-                main()
+                main(path=DATA_PATH, mode=mode)
         else:
             print("❌ No episodes found in dataset")
-        
+
     except FileNotFoundError:
         print(f"❌ Dataset not found: {DATA_PATH}")
         print("Make sure you've recorded some data first using collect.py")
@@ -338,4 +414,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default=DATA_PATH,
+                    help=f"Path to zarr dataset (default: {DATA_PATH})")
+    ap.add_argument("--mode", default="raw",
+                    choices=["raw", "arrow", "grid", "point", "bar"],
+                    help="Initial image mode to display (toggle in-app with r/a/g/p/b)")
+    args = ap.parse_args()
+    main(path=args.data, mode=args.mode)
