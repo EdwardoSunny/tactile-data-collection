@@ -164,7 +164,26 @@ def render(src_path, dst_path):
 
     # Build sensordrawing once — eagerly constructs both SensorDrawers and
     # both SensorNormalizers. Cheap; identical state for every frame.
-    overlay = SensorOverlay()
+    #
+    # Plumb the captured per-cell baseline (if present) into the normalizers
+    # so post-hoc rendering subtracts the SAME live idle field that the live
+    # --viz overlay used at collection time. Otherwise SensorNormalizer falls
+    # back to the shipped offsets in calibration_{left,right}.npz, which
+    # generally do NOT match an individual hardware unit and bias the arrows.
+    src_meta = src_root["meta"]
+    baseline = None
+    if "tactile_baseline" in src_meta:
+        baseline = np.asarray(src_meta["tactile_baseline"][:], dtype=np.float32)
+        if baseline.shape != (2, 9, 3):
+            print(f"  [warn] /meta/tactile_baseline has unexpected shape {baseline.shape}; "
+                  f"ignoring and using shipped offsets")
+            baseline = None
+        else:
+            print(f"  Baseline: using /meta/tactile_baseline (shape {baseline.shape})")
+    else:
+        print(f"  [warn] no /meta/tactile_baseline in source; "
+              f"using shipped offsets (overlay may be biased)")
+    overlay = SensorOverlay(baseline=baseline)
 
     # ---- Create destination zarr -------------------------------------
     dst_root = zarr.open(dst_path, mode="a")

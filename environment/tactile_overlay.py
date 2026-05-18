@@ -76,19 +76,62 @@ class SensorOverlay:
         out = ov.draw('side', img_bgr_640x480, angles, grip_pos, nL, nR, mode_key='points9_arrow')
 
     Both `image` and the returned drawing are 640x480 uint8 BGR.
+
+    Baseline handling
+    -----------------
+    The bundled calibration_{left,right}.npz files ship an `offset` table that
+    was captured on some other hardware unit / mounting. Sensor magnets drift
+    and individual boards have different rest fields, so feeding raw counts
+    through that stale offset puts the per-cell signal off-zero — the arrows
+    end up biased even when nothing is touching the fingers.
+
+    To fix this, pass the runtime-captured `(2, 9, 3)` baseline (one per
+    finger, captured while the gripper is open at home with no contact) as
+    `baseline=...` at construction, OR call `set_baseline(...)` later. That
+    array replaces the shipped offset via `SensorNormalizer.offset_override`,
+    so normalize() computes `(raw - live_baseline) / scale` instead of
+    `(raw - stale_offset) / scale`. `scale` is always taken from the shipped
+    npz — only the offset is swapped.
     """
 
     # RGBA colors (alpha=77/255 ~= 0.3 transparency), mirroring example_draw.py.
     LEFT_COLOR = (255, 0, 0, 77)
     RIGHT_COLOR = (0, 0, 255, 77)
 
-    def __init__(self):
+    def __init__(self, baseline: Optional[np.ndarray] = None):
         self.drawers = {
             "side":  SensorDrawer(camera_select="side"),
             "wrist": SensorDrawer(camera_select="wrist"),
         }
-        self.norm_L = SensorNormalizer(_calib_path("left"))
-        self.norm_R = SensorNormalizer(_calib_path("right"))
+        self.norm_L: SensorNormalizer
+        self.norm_R: SensorNormalizer
+        self._build_normalizers(baseline)
+
+    def _build_normalizers(self, baseline: Optional[np.ndarray]):
+        """(Re)construct the two SensorNormalizer instances, optionally with
+        the given (2, 9, 3) baseline as per-finger offset_override."""
+        offset_L = offset_R = None
+        if baseline is not None:
+            arr = np.asarray(baseline, dtype=np.float32)
+            if arr.shape != (2, 9, 3):
+                raise ValueError(
+                    f"baseline must have shape (2, 9, 3); got {arr.shape}"
+                )
+            offset_L, offset_R = arr[0], arr[1]
+        self.norm_L = SensorNormalizer(_calib_path("left"),  offset_override=offset_L)
+        self.norm_R = SensorNormalizer(_calib_path("right"), offset_override=offset_R)
+        self._baseline = None if baseline is None else np.asarray(baseline, dtype=np.float32).copy()
+
+    def set_baseline(self, baseline: Optional[np.ndarray]):
+        """Re-create the per-finger normalizers with a new offset_override.
+
+        Pass `None` to revert to the shipped calibration offsets.
+        """
+        self._build_normalizers(baseline)
+
+    def get_baseline(self) -> Optional[np.ndarray]:
+        """Returns a copy of the installed baseline, or None if not set."""
+        return None if self._baseline is None else self._baseline.copy()
 
     def normalize(self, raw_L: Optional[np.ndarray], raw_R: Optional[np.ndarray]):
         """Apply per-finger SensorNormalizer to raw (9, 3) tactile arrays.

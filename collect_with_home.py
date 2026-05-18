@@ -261,10 +261,18 @@ def main():
         # SensorNormalizers eagerly; only build it when we'll actually use it
         # so the script still starts cleanly when sensordrawing's bundled
         # transforms/calibrations are missing or incompatible.
+        #
+        # Pass the runtime-captured baseline through so SensorNormalizer
+        # subtracts the LIVE per-cell idle field instead of the shipped offset
+        # in calibration_{left,right}.npz — sensor magnets drift between units
+        # and re-mounts, so the stale shipped offset can bias every arrow.
         overlay = None
         if viz_overlay_on:
             try:
-                overlay = SensorOverlay()
+                overlay = SensorOverlay(baseline=baseline)
+                if baseline is None:
+                    print("  [warn] no tactile baseline available; "
+                          "overlay normalizer will use shipped offsets (may be biased)")
             except Exception as e:
                 print(f"  [warn] could not construct SensorOverlay: {e}")
                 print(f"  [warn] live overlay disabled; raw cameras only")
