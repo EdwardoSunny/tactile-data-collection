@@ -4,18 +4,17 @@ Raw-only dataset recorder.
 This module records the unprocessed data needed to (a) train policies and
 (b) regenerate any number of visualization overlays after the fact:
   - 224x224 camera images, no overlay drawn on them
-  - robot state (xyz + euler + grasp), 7-dim
+  - robot state (xyz + euler + grasp_01), 7-dim         [training target]
+  - joint_angles (7 servo angles, deg)                  [overlay input]
+  - grip_pos     (raw xArm gripper position, 0..850)    [overlay input]
   - per-board raw tactile xyz / connected / device-side ts / host-lag
   - episode_ends in /meta
+  - tactile_baseline in /meta (idle field, used by the gripper-safety wrapper)
 
-Camera identity (serial, native intrinsics, native size, which serial is the
-agent vs the wrist) and the agent's robot->camera extrinsic (trc) are saved
-once into /meta so scripts/render_overlays.py can reproject without needing
-the live RealSense or the transforms_agent.npz file.
-
-The previous img_{i}_raw mirror arrays and the save_raw_images flag are gone:
-img_{i} IS the raw frame now. Overlay images live in a separate zarr
-produced by scripts/render_overlays.py.
+The overlay pipeline lives in environment/sensordrawing/ (camera intrinsics,
+trc, kinematics all bundled there), so the recorder no longer stores
+per-camera metadata — sensordrawing finds everything it needs from joint
+angles + grip_pos at render time.
 """
 import numpy as np
 import zarr
@@ -36,37 +35,28 @@ _num_compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
 
 class DatasetRecorder:
     def __init__(self, path, memory_buffer_size=5000, flush_interval=1.0,
-                 use_actions=True, use_tactile=False, tactile_baseline=None,
-                 camera_metadata=None):
-        """
-        Args:
-            camera_metadata: optional dict written once to /meta when the
-                store is first initialized. Expected keys (all optional, but
-                strongly recommended for render_overlays.py to work):
-                  - serials             : list[str], len = num_cameras
-                  - intrinsics_native   : (num_cameras, 4) [fx, fy, ppx, ppy]
-                  - native_size         : (num_cameras, 2) [width, height]
-                  - agent_serial        : str
-                  - wrist_serial        : str
-                  - trc_agent           : (3, 4) robot -> agent-camera transform
-                  - recorded_img_size   : (2,) [width, height]; defaults to (224, 224)
-        """
+                 use_actions=True, use_tactile=False, tactile_baseline=None):
         self.path = path
         self.memory_buffer_size = memory_buffer_size
         self.flush_interval = flush_interval
         self.use_actions = use_actions
         self.use_tactile = use_tactile
         # Optional per-cell idle baseline (n_sensors, n_taxels, 3). Saved
-        # once to /meta/tactile_baseline so downstream code can subtract it
-        # to get a delta-from-idle view of /data/tactile (which stays raw).
+        # once to /meta/tactile_baseline so the gripper-safety wrapper (which
+        # reads tactile in delta-from-idle units) has a stable reference
+        # without re-capturing each session.
         self.tactile_baseline = tactile_baseline
-        self.camera_metadata = camera_metadata or {}
         self.num_cameras = None
         self.initialized = False
 
         self.memory_buffer = {
             'state': deque(maxlen=memory_buffer_size),
             'n_contacts': deque(maxlen=memory_buffer_size),
+            # joint_angles + grip_pos feed sensordrawing's FK during post-hoc
+            # overlay rendering; required on every tick so render_overlays.py
+            # can project sensor positions without re-querying live hardware.
+            'joint_angles': deque(maxlen=memory_buffer_size),
+            'grip_pos':     deque(maxlen=memory_buffer_size),
             'imgs': [],
         }
         if self.use_actions:
@@ -99,11 +89,42 @@ class DatasetRecorder:
         if "state" in data:
             self.zarr_n = data["state"].shape[0]
             print(f"Resuming existing dataset at step {self.zarr_n}")
+            # Backfill columns introduced after the original recording.
+            # Older datasets (pre-sensordrawing) lack joint_angles + grip_pos;
+            # create them with zero history so new frames can be appended
+            # alongside the existing rows. Overlay rendering on those old
+            # frames will look wrong, but new data is unaffected.
+            if "joint_angles" not in data:
+                arr = data.create_dataset(
+                    "joint_angles", shape=(self.zarr_n, 7),
+                    chunks=(1024, 7), dtype=np.float32,
+                    compressor=_num_compressor,
+                )
+                if self.zarr_n > 0:
+                    arr[:] = 0.0
+            if "grip_pos" not in data:
+                arr = data.create_dataset(
+                    "grip_pos", shape=(self.zarr_n, 1),
+                    chunks=(1024, 1), dtype=np.float32,
+                    compressor=_num_compressor,
+                )
+                if self.zarr_n > 0:
+                    arr[:] = 0.0
         else:
             self.zarr_n = 0
             data.create_dataset(
                 "state", shape=(0, state_dim),
                 chunks=(1024, state_dim), dtype=np.float32,
+                compressor=_num_compressor,
+            )
+            data.create_dataset(
+                "joint_angles", shape=(0, 7),
+                chunks=(1024, 7), dtype=np.float32,
+                compressor=_num_compressor,
+            )
+            data.create_dataset(
+                "grip_pos", shape=(0, 1),
+                chunks=(1024, 1), dtype=np.float32,
                 compressor=_num_compressor,
             )
             if self.use_actions:
@@ -173,12 +194,6 @@ class DatasetRecorder:
                     )
                     meta["tactile_baseline"][:] = baseline_arr
 
-        # Save camera metadata once. Used by scripts/render_overlays.py to
-        # reproject sensor positions onto the recorded frames without needing
-        # the live RealSense or transforms_agent.npz available at render time.
-        # Idempotent: only written if missing.
-        self._save_camera_metadata(meta)
-
         if "episode_ends" not in meta:
             meta.create_dataset(
                 "episode_ends", shape=(0,),
@@ -188,45 +203,6 @@ class DatasetRecorder:
 
         self.initialized = True
         self._start_flush_thread()
-
-    def _save_camera_metadata(self, meta):
-        cm = self.camera_metadata
-        if not cm:
-            return
-        # Strings as a JSON-ish object array. zarr can store object arrays;
-        # we use np.object_ via .astype(str).
-        def _set(name, arr, dtype=None):
-            arr = np.asarray(arr)
-            if dtype is not None:
-                arr = arr.astype(dtype)
-            if name in meta:
-                # Overwrite only if shape changed.
-                if meta[name].shape != arr.shape:
-                    del meta[name]
-                else:
-                    meta[name][...] = arr
-                    return
-            meta.create_dataset(name, shape=arr.shape, dtype=arr.dtype)
-            meta[name][...] = arr
-
-        if "serials" in cm:
-            # Strings -> fixed-width bytes for zarr-portability.
-            serials = np.array([str(s) for s in cm["serials"]], dtype="S64")
-            _set("camera_serials", serials)
-        if "intrinsics_native" in cm:
-            _set("camera_intrinsics_native", cm["intrinsics_native"], dtype=np.float32)
-        if "native_size" in cm:
-            _set("camera_native_size", cm["native_size"], dtype=np.int32)
-        if "agent_serial" in cm:
-            _set("agent_camera_serial",
-                 np.array(str(cm["agent_serial"]), dtype="S64"))
-        if "wrist_serial" in cm:
-            _set("wrist_camera_serial",
-                 np.array(str(cm["wrist_serial"]), dtype="S64"))
-        if "trc_agent" in cm and cm["trc_agent"] is not None:
-            _set("trc_agent", cm["trc_agent"], dtype=np.float64)
-        recorded = cm.get("recorded_img_size", (224, 224))
-        _set("recorded_img_size", recorded, dtype=np.int32)
 
     def _start_flush_thread(self):
         self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
@@ -243,6 +219,8 @@ class DatasetRecorder:
 
         states = list(self.memory_buffer['state'])
         n_contacts = list(self.memory_buffer['n_contacts'])
+        joint_angles = list(self.memory_buffer['joint_angles'])
+        grip_pos = list(self.memory_buffer['grip_pos'])
         if self.use_actions:
             actions = list(self.memory_buffer['action'])
         imgs = [list(self.memory_buffer['imgs'][i]) for i in range(self.num_cameras)]
@@ -255,6 +233,8 @@ class DatasetRecorder:
 
         self.memory_buffer['state'].clear()
         self.memory_buffer['n_contacts'].clear()
+        self.memory_buffer['joint_angles'].clear()
+        self.memory_buffer['grip_pos'].clear()
         if self.use_actions:
             self.memory_buffer['action'].clear()
         for i in range(self.num_cameras):
@@ -272,7 +252,7 @@ class DatasetRecorder:
         min_length = len(states)
         if self.use_actions:
             min_length = min(min_length, len(actions))
-        min_length = min(min_length, len(n_contacts))
+        min_length = min(min_length, len(n_contacts), len(joint_angles), len(grip_pos))
         if self.num_cameras > 0:
             min_length = min(min_length, min(len(imgs[i]) for i in range(self.num_cameras)))
         if self.use_tactile:
@@ -284,6 +264,8 @@ class DatasetRecorder:
 
         states = states[:min_length]
         n_contacts = n_contacts[:min_length]
+        joint_angles = joint_angles[:min_length]
+        grip_pos = grip_pos[:min_length]
         if self.use_actions:
             actions = actions[:min_length]
         imgs = [img_list[:min_length] for img_list in imgs]
@@ -295,6 +277,8 @@ class DatasetRecorder:
 
         states_array = np.array(states)
         n_contacts_array = np.array(n_contacts)
+        joint_angles_array = np.asarray(joint_angles, dtype=np.float32)
+        grip_pos_array = np.asarray(grip_pos, dtype=np.float32).reshape(-1, 1)
         if self.use_actions:
             actions_array = np.array(actions)
         imgs_arrays = [np.array(img_list) for img_list in imgs]
@@ -309,6 +293,8 @@ class DatasetRecorder:
 
         new_size = self.zarr_n + min_length
         data["state"].resize((new_size, data["state"].shape[1]))
+        data["joint_angles"].resize((new_size, data["joint_angles"].shape[1]))
+        data["grip_pos"].resize((new_size, data["grip_pos"].shape[1]))
         if self.use_actions:
             data["action"].resize((new_size, data["action"].shape[1]))
         data["n_contacts"].resize((new_size, data["n_contacts"].shape[1]))
@@ -321,6 +307,8 @@ class DatasetRecorder:
             data["tactile_lag_ms"].resize((new_size, *data["tactile_lag_ms"].shape[1:]))
 
         data["state"][self.zarr_n:new_size] = states_array
+        data["joint_angles"][self.zarr_n:new_size] = joint_angles_array
+        data["grip_pos"][self.zarr_n:new_size] = grip_pos_array
         if self.use_actions:
             data["action"][self.zarr_n:new_size] = actions_array
         data["n_contacts"][self.zarr_n:new_size] = n_contacts_array
@@ -341,9 +329,13 @@ class DatasetRecorder:
 
         self.zarr_n = new_size
 
-    def append(self, state, n_contacts, imgs, action=None,
+    def append(self, state, n_contacts, imgs, joint_angles, grip_pos,
+               action=None,
                tactile=None, tactile_connected=None,
                tactile_ts_ms=None, tactile_lag_ms=None):
+        """Buffer one tick. joint_angles (7,) deg and grip_pos (scalar, 0..850)
+        are REQUIRED — sensordrawing's post-hoc overlay renderer reads them
+        per frame to project sensor positions correctly."""
         if not self.initialized:
             state_dim = len(state)
             act_dim = len(action) if action is not None else 1
@@ -352,6 +344,9 @@ class DatasetRecorder:
             self._init_zarr_store(state_dim, act_dim, img_shapes)
 
         self.memory_buffer['state'].append(state)
+        self.memory_buffer['joint_angles'].append(
+            np.asarray(joint_angles, dtype=np.float32).reshape(7))
+        self.memory_buffer['grip_pos'].append(float(grip_pos))
         if self.use_actions and action is not None:
             self.memory_buffer['action'].append(action)
         self.memory_buffer['n_contacts'].append(n_contacts)

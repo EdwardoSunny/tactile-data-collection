@@ -11,10 +11,10 @@ drives two things:
   - Gripper safety: XArm.step_abs clamps a closing grasp command to the
     previous value when the contact metric exceeds threshold (or readings
     are stale). Wired through environment/xarm_controller.py.
-  - Live --viz overlay: per-cell force arrows drawn on the agent + wrist
-    images for the operator's on-screen feedback ONLY. Recorded frames are
-    always raw (un-overlaid); post-hoc overlay rendering is the job of
-    scripts/render_overlays.py.
+  - Live --viz overlay: sensordrawing's kinematics-aware projection draws
+    one of six (mode, is_spatial) variants on the agent + wrist images for
+    the operator's on-screen feedback ONLY. Recorded frames are always raw;
+    post-hoc overlay rendering is the job of scripts/render_overlays.py.
 
 Quit with Ctrl+C; pynput keystroke listening is intentionally disabled so
 the script works headless over SSH.
@@ -75,9 +75,13 @@ def _read_one_key_nonblocking():
     return None
 
 import tactile_config as tc
-from environment import tactile_overlay
 from environment.phone import Phone
 from environment.tactile import TactileConfig, TactileSensors
+from environment.tactile_overlay import (
+    DEFAULT_MODE_KEY,
+    MODE_KEYS,
+    SensorOverlay,
+)
 from recorder import DatasetRecorder
 from tasks.simple_task import Simple_Task
 from threads import PhoneReadThread, RecordingThread
@@ -87,8 +91,9 @@ def _capture_tactile_baseline(tactile, duration_sec=1.5):
     """Sample tactile frames while gripper is open at home, average per-cell.
 
     Returns a (2, 9, 3) baseline array (xyz per cell per finger), or None if
-    no usable samples arrived. Caller installs this on tactile_overlay so
-    the per-cell static field is subtracted from the squeeze magnitude.
+    no usable samples arrived. Installed on tactile.config.baseline so the
+    gripper-safety wrapper sees readings as delta-from-idle (and so the
+    threshold semantics stay small — see tactile_config.py).
     """
     if tactile is None:
         return None
@@ -96,8 +101,6 @@ def _capture_tactile_baseline(tactile, duration_sec=1.5):
     t_end = time.time() + duration_sec
     while time.time() < t_end:
         states = tactile.get_latest()
-        # Only count samples from frames where both fingers have published
-        # at least once (host_timestamp > 0).
         if all(s.get("host_timestamp", 0.0) > 0 for s in states[:2]):
             xyz_L = np.asarray(states[0]["xyz"], dtype=np.float32)
             xyz_R = np.asarray(states[1]["xyz"], dtype=np.float32)
@@ -108,22 +111,9 @@ def _capture_tactile_baseline(tactile, duration_sec=1.5):
     return np.mean(np.stack(samples), axis=0).astype(np.float32)
 
 
-def _load_agent_transform(npz_path):
-    """Load (serial, trc 3x4) from the converted .npz. Returns (None, None) on failure."""
-    if not os.path.isfile(npz_path):
-        print(f"  [warn] transforms file not found: {npz_path}  -> agent overlay disabled")
-        return None, None
-    try:
-        d = np.load(npz_path, allow_pickle=False)
-        return str(d["serial"]), np.asarray(d["trc"], dtype=np.float64)
-    except Exception as e:
-        print(f"  [warn] couldn't load {npz_path}: {e}  -> agent overlay disabled")
-        return None, None
-
-
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Teleop + recording with tactile safety + overlay. "
+        description="Teleop + recording with tactile safety + sensordrawing overlay. "
                     "Homes the robot to a fixed start pose before each new episode."
     )
     p.add_argument("--record", action="store_true", help="Enable data recording")
@@ -149,15 +139,13 @@ def _parse_args():
                    help="Show live agent + wrist overlay windows during the session "
                         "(needs a DISPLAY; works without --record too). Recorded "
                         "frames stay raw regardless.")
-    p.add_argument("--viz-mode", type=str, default=tc.VISUALIZATION_MODE,
-                   choices=["arrow", "grid", "point", "bar"],
-                   help="What the LIVE --viz windows draw. Does not affect the "
-                        "recorded zarr (always raw). arrow (single per finger; "
-                        "default), grid (9 arrows per finger), point (single "
-                        "circle per finger), bar (binary bottom-bars per finger).")
+    p.add_argument("--viz-mode", type=str, default=DEFAULT_MODE_KEY, choices=MODE_KEYS,
+                   help="Which sensordrawing variant the live --viz windows draw. "
+                        "Does not affect the recorded zarr (always raw) and does "
+                        "not affect scripts/render_overlays.py (renders all 6).")
     p.add_argument("--no-viz-overlay", action="store_true",
                    help="Disable the live overlay computation entirely (the "
-                        "--viz windows, if on, just show the raw camera feeds). "
+                        "--viz windows, if on, just show raw camera feeds). "
                         "Tactile safety still applies when tactile is enabled.")
     return p.parse_args()
 
@@ -186,46 +174,17 @@ def _build_tactile(args):
 
 
 def _camera_role_wiring(env):
-    """Resolve agent/wrist camera serials -> camera indices, plus the agent transform."""
+    """Resolve agent/wrist camera serials -> camera indices.
+
+    sensordrawing carries its own per-camera K + T_rc, so we only need to know
+    which obs key (`camera_{i}`) corresponds to which role.
+    """
     cameras = env.env.cameras
     serial_to_index = {c.serial_number: c.index for c in cameras}
-    intrinsics_by_serial = {c.serial_number: c.intrinsics for c in cameras}
-    agent_serial_from_file, trc_agent = _load_agent_transform(tc.TRANSFORMS_NPZ_PATH)
-    agent_serial = agent_serial_from_file or tc.AGENT_CAMERA_SERIAL
-    wrist_serial = tc.WRIST_CAMERA_SERIAL
-    intrinsics_agent = intrinsics_by_serial.get(agent_serial)
-    return serial_to_index, agent_serial, wrist_serial, trc_agent, intrinsics_agent
+    return serial_to_index, tc.AGENT_CAMERA_SERIAL, tc.WRIST_CAMERA_SERIAL
 
 
-def _build_camera_metadata(env, agent_serial, wrist_serial, trc_agent):
-    """Snapshot of every camera's identity + intrinsics + native size, in
-    camera-index order, plus which serial plays which role and the agent's
-    robot->camera extrinsic. Passed to DatasetRecorder, which writes it once
-    to /meta. scripts/render_overlays.py reads it back so it can project the
-    overlay without needing the live RealSense or transforms_agent.npz."""
-    cameras = sorted(env.env.cameras, key=lambda c: c.index)
-    serials = [str(c.serial_number) for c in cameras]
-    intrinsics_native = np.array(
-        [[c.intrinsics.fx, c.intrinsics.fy, c.intrinsics.ppx, c.intrinsics.ppy]
-         for c in cameras],
-        dtype=np.float32,
-    )
-    native_size = np.array(
-        [[c.intrinsics.width, c.intrinsics.height] for c in cameras],
-        dtype=np.int32,
-    )
-    return {
-        "serials": serials,
-        "intrinsics_native": intrinsics_native,
-        "native_size": native_size,
-        "agent_serial": agent_serial,
-        "wrist_serial": wrist_serial,
-        "trc_agent": trc_agent,
-        "recorded_img_size": np.array([224, 224], dtype=np.int32),
-    }
-
-
-def _print_banner(args, tactile, agent_overlay_ok, wrist_overlay_ok, frequency):
+def _print_banner(args, tactile, overlay_ok, frequency):
     print()
     print("=" * 60)
     print("  READY")
@@ -242,8 +201,8 @@ def _print_banner(args, tactile, agent_overlay_ok, wrist_overlay_ok, frequency):
         if args.no_viz_overlay:
             print(f"  Live viz    : overlay disabled (--no-viz-overlay)")
         else:
-            print(f"  Live viz    : agent={'ON' if agent_overlay_ok else 'OFF'}  "
-                  f"wrist={'ON' if wrist_overlay_ok else 'OFF'}  mode={args.viz_mode}")
+            print(f"  Live viz    : sensordrawing overlay {'ON' if overlay_ok else 'OFF'}  "
+                  f"mode={args.viz_mode}")
     else:
         print(f"  Tactile     : OFF")
     print(f"  Viz windows : {'ON  (close with Ctrl+C in terminal)' if args.viz else 'OFF'}")
@@ -271,48 +230,46 @@ def main():
             time.sleep(0.1)
         phone.reset(obs["pose"])
 
-        # Capture per-cell baseline at startup (gripper open at home, no contact).
-        # Used by THREE consumers, all in delta-from-idle mode:
-        #   - safety wrapper  : threshold is delta units
-        #   - overlay arrows  : arrow length = |delta|
-        #   - recorder /meta  : saved alongside raw /data/tactile so downstream
-        #                       can compute delta whenever it wants
-        # Captured unconditionally when tactile is on (NOT gated on --no-overlay)
-        # because safety needs it even when the overlay is suppressed.
+        # Tactile baseline. Captured once at startup while the gripper is open
+        # at home so the safety wrapper can interpret its threshold as
+        # "delta from idle" instead of raw counts. Saved into /meta/tactile_baseline
+        # so downstream tooling can subtract it from /data/tactile (which
+        # stays raw). The sensordrawing overlay does NOT consume this — it
+        # has its own per-board calibration shipped under
+        # environment/sensordrawing/calibration_{left,right}.npz.
         baseline = None
         if tactile is not None:
             print("  Sampling tactile baseline (1.5 s, keep fingers untouched)...")
             baseline = _capture_tactile_baseline(tactile, duration_sec=1.5)
             if baseline is not None:
-                # 1) overlay reads from the module-level slot
-                tactile_overlay.set_baseline(baseline)
-                # 2) safety wrapper reads from config.baseline
                 tactile.config.baseline = baseline
-                # Report per-cell |B_force| baseline so the user knows what was subtracted.
                 axis = {"x": 0, "y": 1, "z": 2}[tc.FORCE_AXIS]
                 bL = baseline[0, :, axis]
                 bR = baseline[1, :, axis]
-                print(f"  Baseline captured (subtracted from safety + overlay; raw values still saved).")
+                print(f"  Baseline captured (subtracted by safety wrapper; raw values still saved).")
                 print(f"    {tc.FORCE_AXIS}-axis L: " + " ".join(f"{v:6.0f}" for v in bL))
                 print(f"    {tc.FORCE_AXIS}-axis R: " + " ".join(f"{v:6.0f}" for v in bR))
             else:
-                print("  [warn] couldn't sample baseline; safety + overlay will use raw values")
+                print("  [warn] couldn't sample baseline; safety will use raw values")
 
         frequency = 10.0
 
-        # Camera role / agent-extrinsics wiring (needed for live --viz overlay
-        # AND for the camera metadata we hand to the recorder so future
-        # render_overlays.py runs can reproject without the live RealSense).
-        (serial_to_index, agent_serial, wrist_serial,
-         trc_agent, intrinsics_agent) = _camera_role_wiring(env)
+        serial_to_index, agent_serial, wrist_serial = _camera_role_wiring(env)
         viz_overlay_on = (tactile is not None) and (not args.no_viz_overlay)
-        agent_overlay_ok = (
-            viz_overlay_on and trc_agent is not None and intrinsics_agent is not None
-        )
-        wrist_overlay_ok = viz_overlay_on
-        if viz_overlay_on and not agent_overlay_ok:
-            print(f"  [warn] agent camera ({agent_serial}) transform or intrinsics "
-                  f"unavailable  -> live agent overlay disabled (recording still raw)")
+
+        # SensorOverlay constructs both SensorDrawer instances + both
+        # SensorNormalizers eagerly; only build it when we'll actually use it
+        # so the script still starts cleanly when sensordrawing's bundled
+        # transforms/calibrations are missing or incompatible.
+        overlay = None
+        if viz_overlay_on:
+            try:
+                overlay = SensorOverlay()
+            except Exception as e:
+                print(f"  [warn] could not construct SensorOverlay: {e}")
+                print(f"  [warn] live overlay disabled; raw cameras only")
+                overlay = None
+                viz_overlay_on = False
 
         recorder = None
         recording_thread = None
@@ -320,9 +277,6 @@ def main():
         # (it computes overlays the viz windows read).
         if args.record or args.viz:
             if args.record:
-                camera_metadata = _build_camera_metadata(
-                    env, agent_serial, wrist_serial, trc_agent
-                )
                 recorder = DatasetRecorder(
                     "teleop_data.zarr",
                     memory_buffer_size=5000,
@@ -330,7 +284,6 @@ def main():
                     use_actions=False,
                     use_tactile=(tactile is not None),
                     tactile_baseline=baseline,   # saved once to /meta/tactile_baseline
-                    camera_metadata=camera_metadata,
                 )
             recording_thread = RecordingThread(
                 recorder, env, frequency,
@@ -339,18 +292,17 @@ def main():
                 agent_serial=agent_serial,
                 wrist_serial=wrist_serial,
                 serial_to_index=serial_to_index,
-                trc_agent=trc_agent,
-                intrinsics_agent=intrinsics_agent,
+                overlay=overlay,
                 draw_overlay=viz_overlay_on,
-                viz_mode=args.viz_mode,
+                viz_mode_key=args.viz_mode,
             )
             recording_thread.start()
 
         phone_thread = PhoneReadThread(phone)
         phone_thread.start()
 
-        _print_banner(args, tactile, agent_overlay_ok, wrist_overlay_ok, frequency)
-        # Single-key non-blocking terminal input (used for 'd' = discard).
+        _print_banner(args, tactile, viz_overlay_on and overlay is not None, frequency)
+        # Single-key non-blocking terminal input (used for Backspace = discard).
         _enter_cbreak_mode()
 
         last_button_check = 0.0

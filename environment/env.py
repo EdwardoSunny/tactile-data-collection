@@ -44,8 +44,32 @@ class XArmEnvironment:
         _, pose_6d = self.xarm.arm.get_position(is_radian=False)
         return pose_6d
 
+    def get_joint_angles(self):
+        """7 servo angles in degrees — sensordrawing's FK input."""
+        _, angles = self.xarm.arm.get_servo_angle(is_radian=False)
+        return angles[:7]
+
+    def get_grip_pos_raw(self):
+        """Raw xArm gripper position (0..850) — sensordrawing's FK input.
+        Returns float; falls back to the controller's cached commanded grasp
+        mapped into the same units if the gripper isn't enabled."""
+        try:
+            code, pos = self.xarm.arm.get_gripper_position()
+            if code == 0 and pos is not None:
+                return float(pos)
+        except Exception:
+            pass
+        # Fallback: map cached grasp in [0,1] back to SDK units.
+        prev = float(getattr(self.xarm, "previous_grasp", 0.0) or 0.0)
+        cfg = self.xarm_config
+        return float(cfg.gripper_open_pos + prev * (cfg.gripper_close_pos - cfg.gripper_open_pos))
+
     def get_obs(self):
-        obs = {"pose": self.get_pose_6d()}
+        obs = {
+            "pose": self.get_pose_6d(),
+            "joint_angles": self.get_joint_angles(),
+            "grip_pos": self.get_grip_pos_raw(),
+        }
         for camera in self.cameras:
             obs[f"camera_{camera.index}"] = camera.get_latest()
         return obs

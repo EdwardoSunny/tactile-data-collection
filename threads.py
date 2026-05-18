@@ -3,10 +3,11 @@ Background threads for the teleop loop:
   PhoneReadThread   — ~1 kHz poll of phone pose / grasp / button under a lock.
   RecordingThread   — fixed-Hz sampler that pulls env.get_obs() + tactile state,
                       downsizes images to 224x224, and hands the RAW frame
-                      to the DatasetRecorder. Force overlays are drawn on a
-                      separate copy for the live --viz windows only; the
-                      recorded zarr never contains overlay-burned pixels.
-                      Post-hoc overlay rendering is scripts/render_overlays.py.
+                      to the DatasetRecorder. Overlay drawing (sensordrawing)
+                      runs on a separate copy of each native-res frame for the
+                      live --viz windows ONLY; the recorded zarr never contains
+                      overlay-burned pixels. Post-hoc overlay rendering is
+                      scripts/render_overlays.py.
 """
 from __future__ import annotations
 
@@ -17,8 +18,8 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
-from environment import tactile_overlay
 from environment.tactile import TactileSensors
+from environment.tactile_overlay import SensorOverlay, DEFAULT_MODE_KEY
 
 
 class PhoneReadThread(threading.Thread):
@@ -49,8 +50,8 @@ class PhoneReadThread(threading.Thread):
                 target_pose = self.phone.get_target_pose()
                 grasp_state = self.phone.get_grasp_state()
                 button_state = self.phone.get_button_state()
-                # TeleDex's second on-screen button. Used by collect_with_home.py
-                # as a "discard most recent episode" trigger.
+                # TeleDex's second on-screen button. Captured but not consumed
+                # by collect_with_home.py at the moment.
                 button_secondary_state = self.phone.get_button_secondary_state()
                 with self._lock:
                     self.latest_target_pose = target_pose
@@ -64,10 +65,11 @@ class PhoneReadThread(threading.Thread):
 
 class RecordingThread(threading.Thread):
     """Fixed-frequency sampler. Per tick:
-      1. env.get_obs() -> pose + camera frames
+      1. env.get_obs() -> pose + joint_angles + grip_pos + camera frames
       2. tactile.get_latest() -> per-sensor xyz/connected/ts (if wired)
-      3. Optionally draw force overlays on the agent + wrist images at native res
-      4. Resize images to 224x224
+      3. Optionally normalize tactile + draw the sensordrawing overlay on a
+         separate copy of each camera frame (live --viz only)
+      4. Resize raw frames to 224x224
       5. recorder.append(...)
     """
 
@@ -81,10 +83,9 @@ class RecordingThread(threading.Thread):
         agent_serial: Optional[str] = None,
         wrist_serial: Optional[str] = None,
         serial_to_index: Optional[Dict[str, int]] = None,
-        trc_agent: Optional[np.ndarray] = None,
-        intrinsics_agent=None,
+        overlay: Optional[SensorOverlay] = None,
         draw_overlay: bool = True,
-        viz_mode: Optional[str] = None,
+        viz_mode_key: str = DEFAULT_MODE_KEY,
     ):
         super().__init__(daemon=True)
         self.recorder = recorder
@@ -102,26 +103,26 @@ class RecordingThread(threading.Thread):
         # Tactile wiring
         self.tactile = tactile
         self.use_tactile = tactile is not None
-        # Labels are only for log messages; default to "L"/"R" if not given.
         if sensor_labels is None and self.use_tactile:
             sensor_labels = ["L", "R"][: len(tactile.sensors)]
         self.sensor_labels = sensor_labels or []
         self.lag_warning_ms = tactile.config.lag_warning_ms if self.use_tactile else 200
 
-        # Overlay wiring
+        # Overlay wiring — sensordrawing owns all geometry; we only need the
+        # camera-role mapping to know which obs key feeds which SensorDrawer.
         self.agent_serial = agent_serial
         self.wrist_serial = wrist_serial
         self.serial_to_index = serial_to_index or {}
-        self.trc_agent = trc_agent
-        self.intrinsics_agent = intrinsics_agent
-        self.draw_overlay = draw_overlay
-        self.viz_mode = viz_mode  # None -> use tactile_config.VISUALIZATION_MODE default
+        self.overlay = overlay
+        self.draw_overlay = draw_overlay and (overlay is not None) and self.use_tactile
+        self.viz_mode_key = viz_mode_key
 
         # One-shot per-sensor lag warning, re-armed once data is fresh again.
         self._lag_warned: List[bool] = [False] * len(self.sensor_labels)
 
-        # Cached native-resolution overlaid images for live viz. Populated on
-        # every tick whether recording or not; consumed by get_latest_viz().
+        # Cached native-res overlaid frames for live viz. Populated every tick
+        # (even when not recording) so the main thread's cv2.imshow loop has
+        # fresh frames; consumed by get_latest_viz().
         self._viz_lock = threading.Lock()
         self._latest_agent_viz: Optional[np.ndarray] = None
         self._latest_wrist_viz: Optional[np.ndarray] = None
@@ -143,6 +144,10 @@ class RecordingThread(threading.Thread):
 
     def stop(self):
         self.stop_thread = True
+
+    def set_viz_mode_key(self, key: str):
+        """Hot-swap the live --viz mode (next tick picks it up)."""
+        self.viz_mode_key = key
 
     # -----------------------------------------------------------------
     # Per-tick work
@@ -218,9 +223,8 @@ class RecordingThread(threading.Thread):
         """Per-tick observation + overlay computation.
 
         Always runs at tick rate (even when not recording) so the live viz
-        windows can read fresh frames via get_latest_viz(). Returns a tuple
-        of everything _record_one_tick needs to flush a frame, or None if
-        no observation could be acquired.
+        windows can read fresh frames. Returns everything _record_one_tick
+        needs to flush a frame, or None if no observation was available.
         """
         obs = self.env.get_obs()
         if obs is None:
@@ -231,17 +235,16 @@ class RecordingThread(threading.Thread):
         if grasp_state is None:
             grasp_state = 0.0
         state = np.concatenate([np.array(obs["pose"]), [grasp_state]])
+        joint_angles = np.asarray(obs.get("joint_angles", [0.0] * 7), dtype=np.float32)
+        grip_pos = float(obs.get("grip_pos", 0.0))
 
         tactile = self._read_tactile()
         if tactile is not None:
             tactile_values, tactile_connected, ts_arr, lag_arr = tactile
-            # Pull out per-finger arrays for the overlay; expects left=idx 0, right=idx 1.
             vals_L = tactile_values[0] if tactile_values.shape[0] > 0 else None
             vals_R = tactile_values[1] if tactile_values.shape[0] > 1 else None
-            conn_L = tactile_connected[0] if tactile_connected.shape[0] > 0 else None
-            conn_R = tactile_connected[1] if tactile_connected.shape[0] > 1 else None
         else:
-            vals_L = vals_R = conn_L = conn_R = None
+            vals_L = vals_R = None
             tactile_values = tactile_connected = ts_arr = lag_arr = None
 
         agent_img_raw, wrist_img_raw = self._pick_cameras(obs)
@@ -253,24 +256,28 @@ class RecordingThread(threading.Thread):
         if wrist_img_raw is not None:
             wrist_img_raw = wrist_img_raw.copy()
 
-        # Live viz overlay. Drawn on separate copies so the recorder's raw
-        # frames stay un-touched. Skipped entirely when tactile is off or
-        # the operator passed --no-viz-overlay (draw_overlay=False).
+        # Live viz overlay (sensordrawing). Drawn on separate copies so the
+        # recorder's raw frames stay untouched. Skipped when overlay isn't
+        # wired or the operator passed --no-viz-overlay.
         agent_viz = None if agent_img_raw is None else agent_img_raw.copy()
         wrist_viz = None if wrist_img_raw is None else wrist_img_raw.copy()
-        if self.use_tactile and self.draw_overlay:
-            if agent_viz is not None and self.trc_agent is not None and self.intrinsics_agent is not None:
-                agent_viz = tactile_overlay.draw_agent_overlay(
-                    agent_viz, obs["pose"],
-                    vals_L, vals_R, conn_L, conn_R,
-                    self.trc_agent, self.intrinsics_agent,
-                    mode=self.viz_mode,
-                )
-            if wrist_viz is not None:
-                wrist_viz = tactile_overlay.draw_wrist_overlay(
-                    wrist_viz, vals_L, vals_R, conn_L, conn_R,
-                    mode=self.viz_mode,
-                )
+        if self.draw_overlay and self.overlay is not None:
+            try:
+                nL, nR = self.overlay.normalize(vals_L, vals_R)
+                if agent_viz is not None:
+                    agent_viz = self.overlay.draw(
+                        "side", agent_viz, joint_angles, grip_pos, nL, nR,
+                        mode_key=self.viz_mode_key,
+                    )
+                if wrist_viz is not None:
+                    wrist_viz = self.overlay.draw(
+                        "wrist", wrist_viz, joint_angles, grip_pos, nL, nR,
+                        mode_key=self.viz_mode_key,
+                    )
+            except Exception as e:
+                # Don't take down the recording thread if the overlay hits a bad
+                # frame — log once and keep going with raw pixels.
+                print(f"  [overlay] draw failed: {e}")
 
         # Cache native-res overlaid frames for live viz consumers.
         with self._viz_lock:
@@ -278,7 +285,8 @@ class RecordingThread(threading.Thread):
             self._latest_wrist_viz = None if wrist_viz is None else wrist_viz.copy()
             self._latest_viz_time = time.monotonic()
 
-        return (state, agent_img_raw, wrist_img_raw,
+        return (state, joint_angles, grip_pos,
+                agent_img_raw, wrist_img_raw,
                 tactile_values, tactile_connected, ts_arr, lag_arr)
 
     def _record_one_tick(self):
@@ -286,21 +294,21 @@ class RecordingThread(threading.Thread):
 
         No-op when recorder is None (viz-only mode). Resize-to-224 happens here
         so the recorder only ever sees 224x224 frames regardless of camera res.
-        Recorder always receives RAW (un-overlaid) images; any overlay rendering
-        happens after the fact via scripts/render_overlays.py.
+        Recorder always receives RAW (un-overlaid) images; any overlay
+        rendering happens via scripts/render_overlays.py.
         """
         result = self._compute_tick()
         if result is None or self.recorder is None:
             return
-        (state, agent_img_raw, wrist_img_raw,
+        (state, joint_angles, grip_pos,
+         agent_img_raw, wrist_img_raw,
          tactile_values, tactile_connected, ts_arr, lag_arr) = result
 
         # Race guard: the main thread may have called set_recording(False)
-        # while we were inside _compute_tick (env.get_obs + overlay drawing
-        # together can take 40-80ms). If recording was just turned off, drop
-        # this frame entirely — otherwise it'd land AFTER end_episode() ran,
-        # opening a fresh video writer and creating an orphan frame that
-        # makes discard_last_episode() falsely see an "in-progress" episode.
+        # while we were inside _compute_tick (env.get_obs + overlay together
+        # can take 40-80ms). If recording just turned off, drop this frame —
+        # otherwise it'd land AFTER end_episode() ran and orphan into the
+        # "in-progress" slot, breaking discard_last_episode()'s assertion.
         with self._lock:
             still_recording = self.recording and self.episode_started
         if not still_recording:
@@ -318,6 +326,8 @@ class RecordingThread(threading.Thread):
                 state=state,
                 n_contacts=np.array([0]),
                 imgs=camera_imgs,
+                joint_angles=joint_angles,
+                grip_pos=grip_pos,
                 tactile=tactile_values,
                 tactile_connected=tactile_connected,
                 tactile_ts_ms=ts_arr,
@@ -328,6 +338,8 @@ class RecordingThread(threading.Thread):
                 state=state,
                 n_contacts=np.array([0]),
                 imgs=camera_imgs,
+                joint_angles=joint_angles,
+                grip_pos=grip_pos,
             )
 
     def get_latest_viz(self):
