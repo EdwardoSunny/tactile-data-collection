@@ -1,0 +1,19 @@
+# Python 3.10+.
+#
+# numpy<2 is REQUIRED if you intend to import any external `.npy` saved by an
+# older numpy (and equally numpy>=2 works for this repo's bundled `.npz` data
+# since transforms are pickle-free). The repo itself works under either major
+# version; the upper bound below just avoids surprise breakage on hosts that
+# still ship 1.x scientific stacks.
+numpy>=1.24,<3
+scipy>=1.11
+opencv-python>=4.8
+pyserial>=3.5
+zarr>=2.16,<3                # zarr 3 changes the on-disk format; recorder/dataset target 2.x
+pynput>=1.7                  # only used by some helper scripts; safe to omit on headless servers
+torch>=2.0                   # 6D-rotation conversions in dataset.py
+pyrealsense2>=2.54           # Intel RealSense; install matching librealsense system pkg first
+
+# Not pip-published — install from upstream:
+#   xarm   : https://github.com/xArm-Developer/xArm-Python-SDK
+#   teledex: iPhone AR client (yluo/Anthropic-internal)
