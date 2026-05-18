@@ -39,8 +39,15 @@ Flags: `--no-tactile`, `--no-viz-overlay`, `--safety-threshold N`, `--safety-met
    ```bash
    sudo chmod 777 /dev/ttyACM0
    ```
-4. On the board's onboard screen: select **sensor**, right-push the button; then select **stream**, right-push the button. The board now streams `S,ts,idx,addr,conn,x,y,z` rows over USB serial.
-5. Repeat for the second board. By convention LEFT finger = `/dev/ttyACM0`, RIGHT = `/dev/ttyACM1` — match this to `tactile_config.LEFT_FINGER_PORT` / `RIGHT_FINGER_PORT` (or override with `--left-port` / `--right-port`).
+4. On the board's onboard screen, select **sensor** and right-push the button:
+
+   ![Step 1 — select sensor](docs/sensor_setup/step1.jpg)
+
+5. Then select **stream** and right-push the button. The board now streams `S,ts,idx,addr,conn,x,y,z` rows over USB serial:
+
+   ![Step 2 — select stream](docs/sensor_setup/step2.jpg)
+
+6. Repeat for the second board. By convention LEFT finger = `/dev/ttyACM0`, RIGHT = `/dev/ttyACM1` — match this to `tactile_config.LEFT_FINGER_PORT` / `RIGHT_FINGER_PORT` (or override with `--left-port` / `--right-port`).
 
 To sanity-check streaming before running the full harness, use the standalone
 `receive_a31301_stream.py` script in `customsensor/`.
