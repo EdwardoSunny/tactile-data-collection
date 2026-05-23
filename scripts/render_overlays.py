@@ -24,6 +24,21 @@ afterwards. Inputs sensordrawing needs each frame:
   - /data/grip_pos     : (N, 1) raw xArm gripper position (0..850)
   - /data/tactile      : (N, 2, 9, 3) raw per-finger tactile xyz
   Plus per-finger calibration_{left,right}.npz under environment/sensordrawing/.
+
+Tactile NORMALIZATION is computed from the dataset itself, NOT from the
+1.5s idle baseline captured at session start or from the shipped per-cell
+hardware calibration. Specifically:
+  - per-cell, per-axis OFFSET = median across all frames (robust idle estimate)
+  - per-finger XY scale       = 95th percentile of |xy - offset_xy|
+  - per-finger Z  scale       = 95th percentile of |z  - offset_z|
+After this, the strongest 5% of contacts saturate above 1.0 and lighter
+contacts get the rest of the dynamic range. The arrows you see are therefore
+scaled to "what this task's contacts actually look like" — a heavy press in
+cube and the same heavy press in tube will both produce arrows near full
+length, even if the absolute raw counts differ.
+
+Arrows + dots are drawn bolder than the sensordrawing defaults (5 px lines,
+16 px dots) so they read cleanly when viewed at the recorded 224x224 scale.
 """
 import argparse
 import os
@@ -44,6 +59,84 @@ from environment.tactile_overlay import MODES, MODE_KEYS, SensorOverlay, mode_ke
 # sensordrawing was calibrated at 640x480; upscale recorded frames to this
 # before drawing so K and T_rc map onto the right pixel coordinates.
 NATIVE_W, NATIVE_H = 640, 480
+
+
+# Visual style: arrows + dots are drawn bolder than the sensordrawing defaults
+# (2 px lines, 10 px dots) so they read clearly at 224x224 viewing scale.
+BOLD_ARROW_THICKNESS = 8
+BOLD_DOT_SIZE = 22
+
+
+# Dataset-wide normalization knobs. Per cell+axis offset is the median across
+# the WHOLE dataset (robust idle estimate); per-finger scale is the Nth
+# percentile of |raw - offset| across all frames+cells for that finger.
+# 99 instead of 95 keeps the saturation point well past the noise band — at
+# p95 in datasets where most frames are idle, the scale ends up dominated by
+# the upper end of the noise distribution and lighter contacts amplify noise
+# visually.
+DATASET_PERCENTILE = 99.0
+
+# After normalization, suppress arrows for cells whose normalized force-vector
+# magnitude is below this threshold. Acts as a hard noise gate: idle wobble
+# normalizes to a small but non-zero vector (because the noise floor is real),
+# and without a gate it draws visible jitter even when nothing's touching the
+# fingers. 0.12 = "ignore the bottom 12% of arrow length", which empirically
+# kills idle jitter on cube/tube while preserving any real contact arrow.
+NOISE_DEADBAND = 0.12
+
+
+def _apply_deadband(norm_arr, threshold):
+    """Per-cell hard noise gate: zero out cells whose normalized (x, y, z)
+    vector has L2 magnitude below `threshold`. Preserves vector direction
+    for cells above the gate.
+
+    norm_arr shape: (9, 3) or None. Returns same shape.
+    """
+    if norm_arr is None or threshold <= 0:
+        return norm_arr
+    arr = np.asarray(norm_arr, dtype=np.float32).copy()
+    mag = np.linalg.norm(arr, axis=-1, keepdims=True)  # (9, 1)
+    return np.where(mag < threshold, 0.0, arr)
+
+
+def _dataset_normalization(tactile_zarr):
+    """Compute offset (idle per cell+axis) and per-finger global xy/z scales
+    from the WHOLE dataset, replacing the SensorNormalizer's shipped per-cell
+    calibration with stats derived from this task's actual data.
+
+    Args:
+        tactile_zarr: zarr array of shape (N, 2, 9, 3)
+
+    Returns:
+        offset    : (2, 9, 3) float32   per-cell median over all frames
+        scale_xy  : (2,) float32        per-finger 95th pct of |xy - offset_xy|
+        scale_z   : (2,) float32        per-finger 95th pct of |z  - offset_z|
+    """
+    raw = np.asarray(tactile_zarr[:], dtype=np.float64)  # (N, 2, 9, 3)
+    if raw.size == 0:
+        return (np.zeros((2, 9, 3), dtype=np.float32),
+                np.ones(2, dtype=np.float32),
+                np.ones(2, dtype=np.float32))
+
+    # Per-cell, per-axis median is the right "what does this cell read at
+    # rest" estimate: it ignores contact events, which are a small fraction
+    # of frames in most teleop datasets.
+    offset = np.median(raw, axis=0)                       # (2, 9, 3)
+    delta = raw - offset                                   # (N, 2, 9, 3)
+
+    scale_xy = np.empty(2, dtype=np.float64)
+    scale_z = np.empty(2, dtype=np.float64)
+    for fi in range(2):
+        xy = np.abs(delta[:, fi, :, :2]).ravel()
+        z = np.abs(delta[:, fi, :, 2]).ravel()
+        scale_xy[fi] = np.percentile(xy, DATASET_PERCENTILE) if xy.size else 1.0
+        scale_z[fi] = np.percentile(z, DATASET_PERCENTILE) if z.size else 1.0
+    # Floor so we never divide by ~0 on a dataset where one axis hardly moves.
+    scale_xy = np.maximum(scale_xy, 1.0)
+    scale_z = np.maximum(scale_z, 1.0)
+    return (offset.astype(np.float32),
+            scale_xy.astype(np.float32),
+            scale_z.astype(np.float32))
 
 
 def _copy_per_frame_arrays(src_data, dst_data, extra_keys=()):
@@ -165,25 +258,29 @@ def render(src_path, dst_path):
     # Build sensordrawing once — eagerly constructs both SensorDrawers and
     # both SensorNormalizers. Cheap; identical state for every frame.
     #
-    # Plumb the captured per-cell baseline (if present) into the normalizers
-    # so post-hoc rendering subtracts the SAME live idle field that the live
-    # --viz overlay used at collection time. Otherwise SensorNormalizer falls
-    # back to the shipped offsets in calibration_{left,right}.npz, which
-    # generally do NOT match an individual hardware unit and bias the arrows.
+    # We OVERRIDE the SensorNormalizer's per-cell offset + per-axis scale
+    # with statistics derived from the entire input dataset (median for
+    # offset, 95th percentile of |raw - offset| for scale). This makes the
+    # arrows scale meaningfully relative to the contacts THIS task actually
+    # contains, instead of relying on (a) a 1.5s-of-idle baseline captured
+    # at session start, or (b) shipped hardware calibration that doesn't
+    # match an individual sensor unit. Pass offset_override=None at
+    # construction time so the shipped values are used as a placeholder,
+    # then patch the live attributes below.
+    overlay = SensorOverlay(baseline=None)
+
     src_meta = src_root["meta"]
-    baseline = None
-    if "tactile_baseline" in src_meta:
-        baseline = np.asarray(src_meta["tactile_baseline"][:], dtype=np.float32)
-        if baseline.shape != (2, 9, 3):
-            print(f"  [warn] /meta/tactile_baseline has unexpected shape {baseline.shape}; "
-                  f"ignoring and using shipped offsets")
-            baseline = None
-        else:
-            print(f"  Baseline: using /meta/tactile_baseline (shape {baseline.shape})")
-    else:
-        print(f"  [warn] no /meta/tactile_baseline in source; "
-              f"using shipped offsets (overlay may be biased)")
-    overlay = SensorOverlay(baseline=baseline)
+    print(f"  Computing dataset-wide normalization across {total_n} frames...")
+    offset_2x9x3, scale_xy_2, scale_z_2 = _dataset_normalization(src_data["tactile"])
+    overlay.norm_L.offset = offset_2x9x3[0]
+    overlay.norm_L.global_scale_xy = float(scale_xy_2[0])
+    overlay.norm_L.global_scale_z = float(scale_z_2[0])
+    overlay.norm_R.offset = offset_2x9x3[1]
+    overlay.norm_R.global_scale_xy = float(scale_xy_2[1])
+    overlay.norm_R.global_scale_z = float(scale_z_2[1])
+    print(f"    LEFT  finger:  scale_xy={scale_xy_2[0]:8.1f}  scale_z={scale_z_2[0]:8.1f}"
+          f"  (p{DATASET_PERCENTILE:.0f} of |raw - median|)")
+    print(f"    RIGHT finger:  scale_xy={scale_xy_2[1]:8.1f}  scale_z={scale_z_2[1]:8.1f}")
 
     # ---- Create destination zarr -------------------------------------
     dst_root = zarr.open(dst_path, mode="a")
@@ -226,10 +323,14 @@ def render(src_path, dst_path):
         joint_chunk = joint_full[start:end]
         grip_chunk = grip_full[start:end]
 
-        # Normalize tactile once per frame (shared across cameras + modes).
+        # Normalize tactile once per frame (shared across cameras + modes),
+        # then gate per-cell normalized vectors below the noise floor so idle
+        # frames don't draw jittery arrows.
         norm_pairs = []
         for j in range(end - start):
             nL, nR = overlay.normalize(tac_chunk[j, 0], tac_chunk[j, 1])
+            nL = _apply_deadband(nL, NOISE_DEADBAND)
+            nR = _apply_deadband(nR, NOISE_DEADBAND)
             norm_pairs.append((nL, nR))
 
         for cam_idx in range(num_cams):
@@ -254,6 +355,8 @@ def render(src_path, dst_path):
                             role, base_native, angles, grip, nL, nR,
                             mode=mode, is_spatial=is_spatial,
                             arrow_length_scale=scale,
+                            arrow_thickness=BOLD_ARROW_THICKNESS,
+                            dot_size=BOLD_DOT_SIZE,
                         )
                     drawn_recorded = cv2.resize(drawn_native, recorded_wh)
                     out_buf[(cam_idx, key)][j] = _to_float32_01(drawn_recorded)

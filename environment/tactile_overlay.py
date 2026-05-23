@@ -33,7 +33,18 @@ from .sensordrawing import SensorDrawer, SensorNormalizer
 # Order is also the canonical ordering for render_overlays.py output arrays.
 MODES = [
     ("points9_arrow",   True,  0.06),
-    ("points1_arrow",   True,  0.006),
+    # points1_arrow draws ONE per-finger arrow whose length = sum(per-cell
+    # normalized values) * arrow_length_scale. The original 0.006 assumed
+    # all 9 cells contribute roughly equally (sum ~ 9 * per-cell value),
+    # so the single arrow ended up the same size as a single points9_arrow
+    # arrow. Once render_overlays.py started gating per-cell noise with a
+    # deadband, only 1-3 cells actually contribute on a typical contact,
+    # so sum ~ 1-3 and the arrow was 10x too short. Bumping the scale to
+    # match points9_arrow's per-cell scale makes single-cell contacts
+    # render an arrow the same length as the corresponding points9_arrow
+    # arrow; multi-cell contacts get proportionally longer arrows, which
+    # is the right behavior since the single arrow represents total force.
+    ("points1_arrow",   True,  0.02),
     ("points1_contact", True,  0.12),
     ("points9_color",   True,  0.12),
     ("points1_contact", False, 0.12),
@@ -148,12 +159,16 @@ class SensorOverlay:
              mode_key: Optional[str] = None,
              mode: Optional[str] = None,
              is_spatial: Optional[bool] = None,
-             arrow_length_scale: Optional[float] = None) -> np.ndarray:
+             arrow_length_scale: Optional[float] = None,
+             arrow_thickness: Optional[int] = None,
+             dot_size: Optional[int] = None) -> np.ndarray:
         """Render one overlay variant onto a 640x480 BGR image.
 
         Either pass `mode_key` (canonical string from MODE_KEYS), or pass
         `mode` + `is_spatial` directly. `arrow_length_scale` falls back to
-        the per-mode default from MODES.
+        the per-mode default from MODES. `arrow_thickness` and `dot_size`
+        override SensorDrawer.draw_on_image's defaults (2 px / 10 px) — pass
+        larger values to make the overlay visually bolder.
         """
         if role not in self.drawers:
             raise ValueError(f"role must be 'side' or 'wrist', got {role!r}")
@@ -171,6 +186,14 @@ class SensorOverlay:
                     0.12,
                 )
 
+        # Forward bold-ness overrides only when set, so draw_on_image's own
+        # defaults still apply when render_overlays.py doesn't override them.
+        extra = {}
+        if arrow_thickness is not None:
+            extra["arrow_thickness"] = arrow_thickness
+        if dot_size is not None:
+            extra["dot_size"] = dot_size
+
         return self.drawers[role].draw_on_image(
             image, angles, grip_pos,
             normalized_left_sensor=normalized_L,
@@ -180,4 +203,5 @@ class SensorOverlay:
             arrow_length_scale=arrow_length_scale,
             left_color=self.LEFT_COLOR,
             right_color=self.RIGHT_COLOR,
+            **extra,
         )
