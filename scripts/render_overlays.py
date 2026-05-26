@@ -291,13 +291,16 @@ def render(src_path, dst_path):
     # training-ready dataset: img_{i} = raw frame, img_{i}_{key} = overlaid.
     _copy_per_frame_arrays(src_data, dst_data, extra_keys=img_keys)
 
-    # Pass-through /meta -> /meta verbatim.
-    for key in src_root["meta"].keys():
-        src_arr = src_root["meta"][key]
-        dst = dst_meta.create_dataset(
-            key, shape=src_arr.shape, dtype=src_arr.dtype,
-        )
-        dst[...] = src_arr[...]
+    # Pass-through /meta -> /meta verbatim (recursive — meta/normalization is a subgroup).
+    def _copy_meta(src, dst):
+        for key in src.keys():
+            item = src[key]
+            if hasattr(item, "shape"):  # zarr Array
+                d = dst.create_dataset(key, shape=item.shape, dtype=item.dtype)
+                d[...] = item[...]
+            else:  # zarr Group
+                _copy_meta(item, dst.require_group(key))
+    _copy_meta(src_root["meta"], dst_meta)
 
     overlay_arrs = _create_overlay_arrays(dst_data, num_cams, img_shape, total_n, img_dtype)
 
