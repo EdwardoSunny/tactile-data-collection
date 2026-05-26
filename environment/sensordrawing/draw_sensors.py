@@ -173,7 +173,7 @@ class SensorDrawer:
 
         # For wrist camera, compute T_rc dynamically from current joint angles
         if self.camera_select == 'wrist' and self.T_link7_to_cam is not None:
-            from xram_kinematics import get_xarm7_forward_kinematics
+            from .xram_kinematics import get_xarm7_forward_kinematics
             T_base_link7 = get_xarm7_forward_kinematics(angles)
             self.T_rc = self.T_link7_to_cam @ np.linalg.inv(T_base_link7)
 
