@@ -29,26 +29,13 @@ import numpy as np
 from .sensordrawing import SensorDrawer, SensorNormalizer
 
 
-# (mode, is_spatial, arrow_length_scale) — verbatim from sensordrawing/example_draw.py.
-# Order is also the canonical ordering for render_overlays.py output arrays.
+# (mode, is_spatial, arrow_length_scale) — only bin_bar now. The old per-cell
+# arrow / contact / color modes were retired; bin_bar (one alpha-blended
+# horizontal bar per finger at the bottom edge, width = avg-force magnitude)
+# is the canonical overlay we train and deploy with.
+# bin_bar requires is_spatial=False (sensordrawing raises otherwise).
 MODES = [
-    ("points9_arrow",   True,  0.06),
-    # points1_arrow draws ONE per-finger arrow whose length = sum(per-cell
-    # normalized values) * arrow_length_scale. The original 0.006 assumed
-    # all 9 cells contribute roughly equally (sum ~ 9 * per-cell value),
-    # so the single arrow ended up the same size as a single points9_arrow
-    # arrow. Once render_overlays.py started gating per-cell noise with a
-    # deadband, only 1-3 cells actually contribute on a typical contact,
-    # so sum ~ 1-3 and the arrow was 10x too short. Bumping the scale to
-    # match points9_arrow's per-cell scale makes single-cell contacts
-    # render an arrow the same length as the corresponding points9_arrow
-    # arrow; multi-cell contacts get proportionally longer arrows, which
-    # is the right behavior since the single arrow represents total force.
-    ("points1_arrow",   True,  0.02),
-    ("points1_contact", True,  0.12),
-    ("points9_color",   True,  0.12),
-    ("points1_contact", False, 0.12),
-    ("points9_color",   False, 0.12),
+    ("bin_bar", False, 0.12),
 ]
 
 
@@ -56,15 +43,16 @@ def mode_key(mode: str, is_spatial: bool) -> str:
     """Canonical string label for a (mode, is_spatial) pair.
 
     Used both as the suffix on img_{i}_{key} zarr arrays and as the choice
-    value for the --viz-mode CLI flag.
+    value for the --viz-mode CLI flag. Flat-only modes (bin_bar) and
+    spatial-only modes (points*_arrow, if ever re-added) skip the suffix.
     """
-    if mode in ("points9_arrow", "points1_arrow"):
-        return mode  # spatial-only modes have no flat variant
+    if mode in ("bin_bar", "points9_arrow", "points1_arrow"):
+        return mode
     return f"{mode}_{'spatial' if is_spatial else 'flat'}"
 
 
 MODE_KEYS = [mode_key(m, s) for (m, s, _) in MODES]
-DEFAULT_MODE_KEY = "points9_arrow"
+DEFAULT_MODE_KEY = "bin_bar"
 
 
 def _key_to_spec(key: str) -> Tuple[str, bool, float]:
