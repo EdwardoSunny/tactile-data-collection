@@ -151,12 +151,17 @@ class SensorDrawer:
                     (requires is_spatial=False). Width is proportional to the L2 norm of the
                     averaged force across 9 sensors. Left bar grows right from the left edge;
                     right bar grows left from the right edge. Bar height is 20 pixels.
+                "third_image" - Render a 3x3 arrow grid for each finger on a black background,
+                    ignoring the input image and robot transforms. Left finger on the left half,
+                    right finger on the right half. Arrow direction encodes (x, y) force in
+                    sensor frame; arrow color encodes z force (green=0, red=1). x,y in [-1,1],
+                    z in [0,1].
             color_scale: Multiplier applied to sensor xyz values before color mapping
                 in points9_color mode. Values are clamped to [-1, 1] after scaling.
             bar_scale: Pixels per unit of L2 force magnitude in bin_bar mode.
                 Bar width = min(magnitude * bar_scale, image_width / 2).
         """
-        valid_modes = ("points9_arrow", "points1_arrow", "points1_contact", "points9_color", "bin_bar")
+        valid_modes = ("points9_arrow", "points1_arrow", "points1_contact", "points9_color", "bin_bar", "third_image")
         if mode not in valid_modes:
             raise ValueError(f"Unsupported mode '{mode}', must be: {', '.join(valid_modes)}")
 
@@ -164,6 +169,46 @@ class SensorDrawer:
             raise ValueError(f"mode='{mode}' requires is_spatial=True")
         if mode == "bin_bar" and is_spatial:
             raise ValueError("mode='bin_bar' requires is_spatial=False")
+
+        if mode == "third_image":
+            h, w = image.shape[:2]
+            img_out = np.zeros((h, w, 3), dtype=np.uint8)
+
+            # Layout: two 3x3 grids, left half / right half, with margins so arrows fit
+            margin = 30
+            gap = 60
+            cell_size = (w - 2 * margin - gap) // 6  # 3 cols per side
+            arrow_px = cell_size // 3                  # max arrow radius in pixels
+
+            left_x = margin
+            right_x = margin + 3 * cell_size + gap
+            top_y = (h - 3 * cell_size) // 2
+
+            for sensor_data, grid_ox in [
+                (normalized_left_sensor, left_x),
+                (normalized_right_sensor, right_x),
+            ]:
+                if sensor_data is None:
+                    continue
+                for idx in range(9):
+                    # Sensor layout: idx 0-2 top row (y=12), 3-5 middle (y=0), 6-8 bottom (y=-12)
+                    # Within each row: col 0=left (x=-12), col 1=center, col 2=right (x=12)
+                    col = idx % 3
+                    row = idx // 3
+                    cx = grid_ox + col * cell_size + cell_size // 2
+                    cy = top_y + row * cell_size + cell_size // 2
+
+                    fx = float(sensor_data[idx, 0])
+                    fy = float(sensor_data[idx, 1])
+                    fz = float(np.clip(sensor_data[idx, 2], 0.0, 1.0))
+
+                    color = (0, int((1.0 - fz) * 255), int(fz * 255))  # BGR: green→red
+
+                    tip_x = int(cx + fx * arrow_px)
+                    tip_y = int(cy - fy * arrow_px)  # flip y: sensor +y = image up
+                    cv2.arrowedLine(img_out, (cx, cy), (tip_x, tip_y), color, 2, tipLength=0.3)
+
+            return img_out
 
         img_out = image.copy()
 
