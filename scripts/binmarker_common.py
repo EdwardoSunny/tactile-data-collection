@@ -1,12 +1,11 @@
 """Shared logic for the binmarker overlay variant.
 
-binmarker (ported from LIBERO_contact_overlay's `binbars` + `arrow` styles):
-one FIXED-LENGTH arrow per finger, anchored at the finger center pad
-(points1_arrow anchor), pointing in the measured aggregate force direction,
-drawn iff that finger's aggregate contact magnitude >= CONTACT_THRESHOLD.
-Binary contact gating like LIBERO's binbars; spatial arrow presentation like
-LIBERO's arrow style. No magnitude information in the pixels — length is
-constant whenever the arrow is visible.
+binmarker (ported from LIBERO_contact_overlay's `binbars` style, presented
+spatially): one arrow per finger, anchored at the finger center pad
+(points1_arrow anchor), with FIXED length AND FIXED direction (sensor-frame
+pad normal), drawn iff that finger's binary contact state is ON. Like
+LIBERO's binbars, the overlay carries NO force magnitude and NO force
+direction — the only signal is the per-finger contact bit.
 
 Normalization: unlike render_overlays.py (global median offset), the offset
 here is the median over KNOWN-IDLE frames (first IDLE_FRAMES frames of each
@@ -93,19 +92,25 @@ def contact_states(m_episode):
     return on
 
 
+# Fixed marker direction in the SENSOR-LOCAL frame: +z = the pad normal
+# (pressure axis). The drawn arrow is therefore a rigid "flag" attached to the
+# finger — identical geometry every frame contact is on. Its 2D appearance
+# varies only with gripper pose / camera view (as any spatial overlay does),
+# NEVER with the force reading.
+FIXED_DIRECTION = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+
 def binmarker_feed(norm_frame_finger, is_on):
-    """(9,3) normalized cells + precomputed ON/OFF -> (9,3) SensorDrawer feed.
+    """Precomputed ON/OFF -> (9,3) SensorDrawer feed. PURE BINARY.
 
     points1_arrow draws the arrow as mean(cells)*9 * arrow_length_scale, so
-    feeding tile(unit(v)/9) yields an arrow of length exactly
-    arrow_length_scale in the direction of the aggregate force v; zeros yield
-    no visible arrow. Direction comes from the cell-sum (robust direction
-    estimate); the on/off gate comes from contact_states (max-cell metric).
+    feeding tile(FIXED_DIRECTION/9) yields an arrow of length exactly
+    arrow_length_scale along the constant sensor-frame direction; zeros yield
+    no visible arrow. BOTH force magnitude AND force direction are omitted —
+    the only information in the overlay is the per-finger contact bit from
+    contact_states (max-cell metric + hysteresis). norm_frame_finger is
+    accepted for signature compatibility but intentionally unused.
     """
     if not is_on:
         return np.zeros((9, 3), dtype=np.float32)
-    v = norm_frame_finger.sum(axis=0)
-    nv = float(np.linalg.norm(v))
-    if nv < 1e-9:
-        return np.zeros((9, 3), dtype=np.float32)
-    return np.tile((v / nv) / 9.0, (9, 1)).astype(np.float32)
+    return np.tile(FIXED_DIRECTION / 9.0, (9, 1)).astype(np.float32)
