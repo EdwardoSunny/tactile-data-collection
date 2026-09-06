@@ -29,6 +29,42 @@ import numpy as np
 from .sensordrawing import SensorDrawer, SensorNormalizer
 
 
+# Render-side visual constants kept for downstream consumers
+# (scripts/render_overlays.py, tactile-openpi/examples/xarm/inference/inference_overlay.py,
+# collect_with_home.py). bin_bar itself doesn't read these — it uses its own
+# bar_scale inside sensordrawing — but legacy callers still import them.
+BOLD_ARROW_THICKNESS = 8
+BOLD_DOT_SIZE = 22
+
+# Per-cell L2 noise gate applied to normalized tactile vectors before drawing.
+# Used by render_overlays.py only; the live viz path skips it.
+NOISE_DEADBAND = 0.12
+
+
+# Live viz uses the SensorNormalizer's shipped per-axis scales (~2000), while
+# render_overlays.py overrides them with dataset-wide stats (~200) computed
+# from the recorded data. That's a ~10x denominator gap, which makes live
+# arrows look stubby compared to the post-hoc render even though everything
+# else is identical. Multiply the per-mode arrow_length_scale by this factor
+# in the live viz only so the on-screen arrows are visually comparable.
+LIVE_VIZ_ARROW_SCALE_MULTIPLIER = 10.0
+
+
+def apply_deadband(norm_arr: Optional[np.ndarray],
+                   threshold: float = NOISE_DEADBAND) -> Optional[np.ndarray]:
+    """Per-cell hard noise gate: zero out cells whose normalized (x, y, z)
+    vector has L2 magnitude below `threshold`. Preserves vector direction
+    for cells above the gate.
+
+    norm_arr shape: (9, 3) or None. Returns same shape.
+    """
+    if norm_arr is None or threshold <= 0:
+        return norm_arr
+    arr = np.asarray(norm_arr, dtype=np.float32).copy()
+    mag = np.linalg.norm(arr, axis=-1, keepdims=True)
+    return np.where(mag < threshold, 0.0, arr)
+
+
 # (mode, is_spatial, arrow_length_scale) — only bin_bar now. The old per-cell
 # arrow / contact / color modes were retired; bin_bar (one alpha-blended
 # horizontal bar per finger at the bottom edge, width = avg-force magnitude)
@@ -36,6 +72,11 @@ from .sensordrawing import SensorDrawer, SensorNormalizer
 # bin_bar requires is_spatial=False (sensordrawing raises otherwise).
 MODES = [
     ("bin_bar", False, 0.12),
+    # Legacy per-cell modes kept so older *_points{1,9}_arrow_lora checkpoints
+    # can still be deployed for ablation comparisons. (mode, is_spatial,
+    # arrow_length_scale) — values mirror the original sensordrawing defaults.
+    ("points9_arrow", True, 0.06),
+    ("points1_arrow", True, 0.02),
 ]
 
 
@@ -60,6 +101,18 @@ def _key_to_spec(key: str) -> Tuple[str, bool, float]:
         if mode_key(m, s) == key:
             return m, s, scale
     raise ValueError(f"Unknown mode_key {key!r}; expected one of {MODE_KEYS}")
+
+
+def live_viz_arrow_length_scale(key: str) -> float:
+    """Per-mode arrow_length_scale for the LIVE --viz path.
+
+    Returns MODES[key].arrow_length_scale * LIVE_VIZ_ARROW_SCALE_MULTIPLIER,
+    so the on-screen arrows are visually comparable to the post-hoc renderer's
+    arrows despite the live viz's larger normalization denominators. Pass the
+    returned value as `arrow_length_scale=` to SensorOverlay.draw().
+    """
+    _, _, default_scale = _key_to_spec(key)
+    return default_scale * LIVE_VIZ_ARROW_SCALE_MULTIPLIER
 
 
 def _calib_path(side: str) -> str:

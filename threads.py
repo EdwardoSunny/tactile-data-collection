@@ -19,7 +19,11 @@ import cv2
 import numpy as np
 
 from environment.tactile import TactileSensors
-from environment.tactile_overlay import SensorOverlay, DEFAULT_MODE_KEY
+from environment.tactile_overlay import (
+    DEFAULT_MODE_KEY,
+    SensorOverlay,
+    live_viz_arrow_length_scale,
+)
 
 
 class PhoneReadThread(threading.Thread):
@@ -259,20 +263,32 @@ class RecordingThread(threading.Thread):
         # Live viz overlay (sensordrawing). Drawn on separate copies so the
         # recorder's raw frames stay untouched. Skipped when overlay isn't
         # wired or the operator passed --no-viz-overlay.
+        #
+        # arrow_length_scale is bumped via live_viz_arrow_length_scale (=
+        # MODES[key].scale * LIVE_VIZ_ARROW_SCALE_MULTIPLIER) so the on-screen
+        # arrows are visibly long enough to read. The live viz uses shipped
+        # SensorNormalizer scales (~2000) while the post-hoc renderer overrides
+        # them with dataset-wide stats (~200), and that ~10x denominator gap
+        # was making the raw-scale live arrows look stubby. The multiplier
+        # only affects what the operator sees on screen — recorded frames stay
+        # raw, and render_overlays.py uses the MODES table as-is.
         agent_viz = None if agent_img_raw is None else agent_img_raw.copy()
         wrist_viz = None if wrist_img_raw is None else wrist_img_raw.copy()
         if self.draw_overlay and self.overlay is not None:
             try:
                 nL, nR = self.overlay.normalize(vals_L, vals_R)
+                scale = live_viz_arrow_length_scale(self.viz_mode_key)
                 if agent_viz is not None:
                     agent_viz = self.overlay.draw(
                         "side", agent_viz, joint_angles, grip_pos, nL, nR,
                         mode_key=self.viz_mode_key,
+                        arrow_length_scale=scale,
                     )
                 if wrist_viz is not None:
                     wrist_viz = self.overlay.draw(
                         "wrist", wrist_viz, joint_angles, grip_pos, nL, nR,
                         mode_key=self.viz_mode_key,
+                        arrow_length_scale=scale,
                     )
             except Exception as e:
                 # Don't take down the recording thread if the overlay hits a bad

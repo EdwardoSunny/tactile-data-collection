@@ -5,7 +5,7 @@ import numpy as np
 import cv2
 import time
 
-DATA_PATH = "teleop_data.zarr"
+DATA_PATH = "/home/u-ril/edward/phone_data_collection/teleop_data.zarr"
 
 # A bare-camera image key is exactly "img_<digit(s)>" (e.g. img_0, img_1).
 # Overlay-augmented arrays are "img_<digit(s)>_<mode>" (e.g. img_0_arrow).
@@ -42,155 +42,130 @@ def _img_key_for(cam_idx, mode):
 def delete_episode(episode_idx):
     import shutil
     import os
-    
+
     try:
         print(f"Opening dataset for deletion...")
         store = zarr.open(DATA_PATH, mode="r")
-        data = store["data"] 
+        data = store["data"]
         meta = store["meta"]
-        
+
         episode_ends = np.array(meta["episode_ends"])
         print(f"Found {len(episode_ends)} episodes")
-        
+
         if episode_idx >= len(episode_ends):
             print(f"Episode index {episode_idx} out of range")
             return False
-            
+
         starts = np.concatenate([[0], episode_ends[:-1]])
-        start_idx = starts[episode_idx]
-        end_idx = episode_ends[episode_idx]
+        start_idx = int(starts[episode_idx])
+        end_idx = int(episode_ends[episode_idx])
         episode_length = end_idx - start_idx
-        
+
         print(f"Deleting episode {episode_idx}: frames {start_idx}-{end_idx} ({episode_length} frames)")
-        
-        total_frames = data["state"].shape[0]
-        state_shape = data["state"].shape[1:]
-        
-        print(f"Total frames: {total_frames}")
-        print(f"State shape: {state_shape}")
-        
-        img_keys = [key for key in data.keys() if key.startswith('img')]
-        print(f"Found image keys: {img_keys}")
-        
-        img_shapes = {}
-        for img_key in img_keys:
-            img_shapes[img_key] = data[img_key].shape[1:]
-            print(f"{img_key} shape: {data[img_key].shape}")
-        
+
+        total_frames = int(data["state"].shape[0])
+        new_total_frames = total_frames - episode_length
+        print(f"Total frames: {total_frames} -> {new_total_frames}")
+
+        # Snapshot per-array specs (shape/dtype/chunks) for every /data/* array.
+        data_keys = list(data.keys())
+        data_specs = {}
+        for key in data_keys:
+            arr = data[key]
+            if arr.shape[0] != total_frames:
+                print(f"  [skip] /data/{key} has leading dim {arr.shape[0]} != {total_frames}; not a per-frame array")
+                continue
+            data_specs[key] = {
+                "shape": arr.shape,
+                "dtype": arr.dtype,
+                "chunks": arr.chunks,
+            }
+        print(f"Per-frame /data arrays to rewrite: {sorted(data_specs.keys())}")
+
+        # Snapshot non-episode_ends meta arrays so we can copy them verbatim.
+        meta_keys = [k for k in meta.keys() if k != "episode_ends"]
+        print(f"/meta arrays to copy verbatim: {meta_keys}")
+
         del store, data, meta
-        
+
         backup_path = DATA_PATH + ".backup"
         if os.path.exists(backup_path):
             shutil.rmtree(backup_path)
         shutil.copytree(DATA_PATH, backup_path)
         print(f"Created backup at {backup_path}")
-        
+
         try:
             shutil.rmtree(DATA_PATH)
-            
+
             new_store = zarr.open(DATA_PATH, mode="w")
             new_data = new_store.create_group("data")
             new_meta = new_store.create_group("meta")
-            
-            print("Creating new zarr arrays...")
-            
-            new_total_frames = total_frames - episode_length
-            print(f"New total frames: {new_total_frames}")
-            
-            try:
-                new_state = new_data.create_dataset("state", shape=(new_total_frames, *state_shape), chunks=True)
-                print(f"Created state array: {new_state.shape}")
-            except Exception as e:
-                print(f"Error creating state array: {e}")
-                raise
-            
-            try:
-                backup_store = zarr.open(backup_path, mode="r")
-                backup_data = backup_store["data"]
-                
-                if "n_contacts" in backup_data:
-                    n_contacts_shape = backup_data["n_contacts"].shape[1:]
-                    new_n_contacts = new_data.create_dataset("n_contacts", shape=(new_total_frames, *n_contacts_shape), chunks=True)
-                else:
-                    new_n_contacts = new_data.create_dataset("n_contacts", shape=(new_total_frames, 1), chunks=True)
-                print(f"Created n_contacts array: {new_n_contacts.shape}")
-            except Exception as e:
-                print(f"Error creating n_contacts array: {e}")
-                raise
-            
-            new_img_arrays = {}
-            for img_key in img_keys:
-                try:
-                    img_shape = img_shapes[img_key]
-                    print(f"Creating {img_key} with shape {(new_total_frames, *img_shape)}")
-                    new_img_arrays[img_key] = new_data.create_dataset(img_key, shape=(new_total_frames, *img_shape), chunks=True)
-                    print(f"Created {img_key} array with shape {new_img_arrays[img_key].shape}")
-                except Exception as e:
-                    print(f"Error creating {img_key} array: {e}")
-                    print(f"Image shape was: {img_shape}")
-                    raise
-            
-            print("Copying data before deleted episode...")
-            
-            if start_idx > 0:
-                chunk_size = min(1000, start_idx)
-                for i in range(0, start_idx, chunk_size):
-                    end_chunk = min(i + chunk_size, start_idx)
-                    
-                    new_state[i:end_chunk] = backup_data["state"][i:end_chunk]
-                    
-                    if "n_contacts" in backup_data:
-                        new_n_contacts[i:end_chunk] = backup_data["n_contacts"][i:end_chunk]
-                    else:
-                        new_n_contacts[i:end_chunk] = 0
-                    
-                    for img_key in img_keys:
-                        new_img_arrays[img_key][i:end_chunk] = backup_data[img_key][i:end_chunk]
-                    
-                    print(f"  Copied chunk {i}:{end_chunk}")
-            
-            print("Copying data after deleted episode...")
-            
-            if end_idx < total_frames:
-                dest_start = start_idx
-                remaining_frames = total_frames - end_idx
-                
-                chunk_size = min(1000, remaining_frames)
-                for i in range(0, remaining_frames, chunk_size):
-                    src_start = end_idx + i
-                    src_end = min(src_start + chunk_size, total_frames)
-                    dest_end = dest_start + (src_end - src_start)
-                    
-                    new_state[dest_start:dest_end] = backup_data["state"][src_start:src_end]
-                    
-                    if "n_contacts" in backup_data:
-                        new_n_contacts[dest_start:dest_end] = backup_data["n_contacts"][src_start:src_end]
-                    else:
-                        new_n_contacts[dest_start:dest_end] = 0
-                    
-                    for img_key in img_keys:
-                        new_img_arrays[img_key][dest_start:dest_end] = backup_data[img_key][src_start:src_end]
-                    
-                    dest_start = dest_end
-                    print(f"  Copied chunk {src_start}:{src_end} -> {dest_start-(src_end-src_start)}:{dest_start}")
-            
+
+            backup_store = zarr.open(backup_path, mode="r")
+            backup_data = backup_store["data"]
+            backup_meta = backup_store["meta"]
+
+            print("Creating new /data arrays...")
+            new_arrays = {}
+            for key, spec in data_specs.items():
+                new_shape = (new_total_frames, *spec["shape"][1:])
+                new_arrays[key] = new_data.create_dataset(
+                    key,
+                    shape=new_shape,
+                    dtype=spec["dtype"],
+                    chunks=spec["chunks"],
+                )
+                print(f"  Created /data/{key}: shape={new_shape} dtype={spec['dtype']}")
+
+            def copy_range(src_lo, src_hi, dst_lo):
+                """Copy backup_data[k][src_lo:src_hi] -> new_arrays[k][dst_lo:dst_lo+(src_hi-src_lo)] for every key."""
+                length = src_hi - src_lo
+                if length <= 0:
+                    return
+                chunk = 1000
+                for off in range(0, length, chunk):
+                    s0 = src_lo + off
+                    s1 = min(s0 + chunk, src_hi)
+                    d0 = dst_lo + off
+                    d1 = d0 + (s1 - s0)
+                    for key in data_specs:
+                        new_arrays[key][d0:d1] = backup_data[key][s0:s1]
+                    print(f"  Copied src[{s0}:{s1}] -> dst[{d0}:{d1}]")
+
+            print("Copying frames before deleted episode...")
+            copy_range(0, start_idx, 0)
+
+            print("Copying frames after deleted episode...")
+            copy_range(end_idx, total_frames, start_idx)
+
+            # Rebuild episode_ends without the deleted entry, shifting later ones back.
             new_episode_ends = []
             for i, ep_end in enumerate(episode_ends):
                 if i == episode_idx:
                     continue
                 elif ep_end > episode_ends[episode_idx]:
-                    new_episode_ends.append(ep_end - episode_length)
+                    new_episode_ends.append(int(ep_end) - episode_length)
                 else:
-                    new_episode_ends.append(ep_end)
-            
-            new_episode_ends = np.array(new_episode_ends)
+                    new_episode_ends.append(int(ep_end))
+            new_episode_ends = np.array(new_episode_ends, dtype=episode_ends.dtype)
             new_meta.create_dataset("episode_ends", data=new_episode_ends, chunks=True)
-            print(f"Updated episode ends: {new_episode_ends}")
-            
+            print(f"Updated episode_ends: {new_episode_ends}")
+
+            # Copy every other /meta/* array verbatim (e.g. tactile_baseline).
+            for key in meta_keys:
+                src = backup_meta[key]
+                new_meta.create_dataset(
+                    key,
+                    data=np.array(src),
+                    dtype=src.dtype,
+                    chunks=src.chunks,
+                )
+                print(f"  Copied /meta/{key} verbatim: shape={src.shape}")
+
             shutil.rmtree(backup_path)
             print("Successfully deleted episode and cleaned up backup")
             return True
-            
+
         except Exception as e:
             print(f"Error recreating dataset: {e}")
             if os.path.exists(backup_path):
@@ -199,7 +174,7 @@ def delete_episode(episode_idx):
                 shutil.move(backup_path, DATA_PATH)
                 print("Restored backup due to error")
             return False
-            
+
     except Exception as e:
         print(f"Error deleting episode: {e}")
         import traceback

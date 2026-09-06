@@ -110,6 +110,43 @@ class DatasetRecorder:
                 )
                 if self.zarr_n > 0:
                     arr[:] = 0.0
+            # Same story for the tactile columns: a dataset recorded with
+            # use_tactile=False (or pre-tactile) has none of these arrays, so
+            # resuming with tactile on would KeyError inside _flush_to_zarr.
+            # Backfill with zeros for the historical rows.
+            if self.use_tactile:
+                if "tactile" not in data:
+                    arr = data.create_dataset(
+                        "tactile", shape=(self.zarr_n, 2, 9, 3),
+                        chunks=(1024, 2, 9, 3), dtype=np.float32,
+                        compressor=_num_compressor,
+                    )
+                    if self.zarr_n > 0:
+                        arr[:] = 0.0
+                if "tactile_connected" not in data:
+                    arr = data.create_dataset(
+                        "tactile_connected", shape=(self.zarr_n, 2, 9),
+                        chunks=(1024, 2, 9), dtype=np.uint8,
+                        compressor=_num_compressor,
+                    )
+                    if self.zarr_n > 0:
+                        arr[:] = 0
+                if "tactile_ts_ms" not in data:
+                    arr = data.create_dataset(
+                        "tactile_ts_ms", shape=(self.zarr_n, 2),
+                        chunks=(1024, 2), dtype=np.int64,
+                        compressor=_num_compressor,
+                    )
+                    if self.zarr_n > 0:
+                        arr[:] = 0
+                if "tactile_lag_ms" not in data:
+                    arr = data.create_dataset(
+                        "tactile_lag_ms", shape=(self.zarr_n, 2),
+                        chunks=(1024, 2), dtype=np.float32,
+                        compressor=_num_compressor,
+                    )
+                    if self.zarr_n > 0:
+                        arr[:] = 0.0
         else:
             self.zarr_n = 0
             data.create_dataset(
