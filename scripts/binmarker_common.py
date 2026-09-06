@@ -114,3 +114,33 @@ def binmarker_feed(norm_frame_finger, is_on):
     if not is_on:
         return np.zeros((9, 3), dtype=np.float32)
     return np.tile(FIXED_DIRECTION / 9.0, (9, 1)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# binmarker9: the 9-arrow counterpart of binmarker.
+# ---------------------------------------------------------------------------
+# binmarker (1 arrow)  and binmarker9 (9 arrows) form a matched pair that
+# isolates ARROW COUNT while holding the information content fixed: both carry
+# ONLY the per-finger binary contact bit — no force direction, no magnitude.
+#
+# Why a separate feed builder instead of reusing binmarker_feed():
+#   points1_arrow draws ONE arrow from mean(cells)*9, so a feed of
+#   tile(FIXED_DIRECTION/9) integrates to exactly FIXED_DIRECTION.
+#   points9_arrow instead draws a SEPARATE arrow per cell i, with tip at
+#   sensor_pts[i] + sensor_data[i]*arrow_length_scale. To give each of the 9
+#   arrows the same length/direction as binmarker's single arrow, each cell
+#   must carry the FULL unit vector — NOT the /9-scaled one. Feeding the /9
+#   version here would render 9 arrows at 1/9 the intended length.
+def binmarker9_feed(norm_frame_finger, is_on):
+    """Precomputed ON/OFF -> (9,3) SensorDrawer feed for mode='points9_arrow'.
+
+    PURE BINARY, exactly like binmarker_feed: every visible arrow has fixed
+    length (arrow_length_scale=FIXED_ARROW_LEN) and fixed direction
+    (FIXED_DIRECTION, the sensor-frame pad normal). Both force magnitude and
+    force direction are omitted; the only signal is the per-finger contact bit.
+    `norm_frame_finger` is accepted for signature compatibility and is
+    intentionally unused (the output cannot depend on the force reading).
+    """
+    if not is_on:
+        return np.zeros((9, 3), dtype=np.float32)
+    return np.tile(FIXED_DIRECTION, (9, 1)).astype(np.float32)
